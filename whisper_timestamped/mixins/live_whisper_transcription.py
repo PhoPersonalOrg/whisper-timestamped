@@ -195,8 +195,8 @@ class LiveWhisperTranscriptionAppMixin:
         """
         self.transcription_config = LiveConfig(
             model="medium",  # Good balance of speed and accuracy
-            device=None,  # Auto-detect
-            compute_type=None,  # Auto-detect
+            device=None,  # Auto-detect: LiveTranscriber prefers CUDA when available, falls back to CPU
+            compute_type=None,  # Auto-detect: float16 on CUDA, int8 on CPU
             language='en',  # Auto-detect
             beam_size=1,
             vad_filter=True,
@@ -398,7 +398,8 @@ class LiveWhisperTranscriptionAppMixin:
         device_var = tk.StringVar(value=self.transcription_config.device or "auto")
         device_combo = ttk.Combobox(main_frame, textvariable=device_var,
                                    values=["auto", "cpu", "cuda"], state="readonly")
-        device_combo.pack(fill=tk.X, pady=(0, 10))
+        device_combo.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(main_frame, text="Auto uses CUDA when available, otherwise CPU.", font=("TkDefaultFont", 8)).pack(anchor=tk.W, pady=(0, 10))
 
         # VAD filter
         vad_var = tk.BooleanVar(value=self.transcription_config.vad_filter)
