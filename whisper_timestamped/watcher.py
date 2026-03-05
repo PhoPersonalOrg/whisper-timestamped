@@ -88,7 +88,7 @@ def cli(argv=None):
     output_dir = Path(args.output_dir).resolve() if args.output_dir else None
 
     if Observer is None:
-        raise RuntimeError("watchdog is not installed. Please install with 'pip install ".[watch]" or 'pip install watchdog'.")
+        raise RuntimeError('watchdog is not installed. Please install with \'pip install ".[watch]"\' or \'pip install watchdog\'.')
 
     handler = Handler(recordings_dir, output_dir, args.min_age_s, args.cool_down_s)
     observer = Observer()
