@@ -2,13 +2,15 @@ import os
 # import sys
 # import argparse
 import json
+import time
 from pathlib import Path
 from typing import List
 
+import torch
 from whisper.utils import str2bool, optional_float, optional_int
 import whisper_timestamped as whisper
-from whisper_timestamped.transcribe import write_csv, flatten, remove_keys
-from parse_video_filename import build_EDF_compatible_video_filename, parse_video_filename
+from whisper_timestamped.transcribe import write_csv, flatten, remove_keys, get_vad_segments
+from whisper_timestamped.parse_video_filename import build_EDF_compatible_video_filename, parse_video_filename
 # from whisper_timestamped import remove_non_speech
 from whisper_timestamped.transcribe import remove_non_speech
 
@@ -189,90 +191,81 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
 
     output_dir.mkdir(exist_ok=True)
     print(f'\t transcriptions will output to output_dir: "{output_dir.as_posix()}"')
-    
-    # Load the model once
-    print(f"Loading Whisper model at model_path_root: '{model_path_root.as_posix()}'...")
-    model_path_root = model_path_root.resolve()
-    assert model_path_root.exists()
-    model_name: str = "medium.en"
-    # model_name: str = "large-v3"
-    # model = whisper.load_model("medium.en")
-    model = whisper.load_model(model_name, download_root=model_path_root) # , backend='transformers', device='cuda'
-    # model = whisper.load_model("medium.en", backend='transformers') # , download_root=model_path_root.as_posix()
-    
-    # Get all video files in the recordings directory
-    
+
+    # Get all video files and create alias dir before loading model (so "Found N files" appears quickly)
     video_files = []
     for ext in video_extensions:
         video_files.extend(recordings_dir.glob(f"*{ext}"))
         video_files.extend(recordings_dir.glob(f"*{ext.upper()}"))
-    
 
-    progress_files = []
-    output_dir
-
-    ## Alias directory to hold EDF+ compatibly named videos (with appropriate filenames)
     alias_dir = recordings_dir.parent / "edf_video_aliases"
     alias_dir.mkdir(exist_ok=True)
 
     if not video_files:
         print(f"No video files found in {recordings_dir}")
         return
-    
+
     print(f"Found {len(video_files)} video files to process")
-    
+
+    # Load the model once (after file discovery so progress is visible sooner)
+    model_path_root = model_path_root.resolve()
+    assert model_path_root.exists()
+    model_name: str = "medium.en"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading Whisper model at model_path_root: '{model_path_root.as_posix()}' (device={device})...")
+    t0_model = time.perf_counter()
+    model = whisper.load_model(model_name, download_root=str(model_path_root), device=device)
+    print(f"Whisper model loaded. (Model load: {time.perf_counter() - t0_model:.1f}s)")
+
+    # Preload Silero VAD so first-file transcribe does not stall with no progress
+    print("Loading Silero VAD...")
+    get_vad_segments(torch.zeros(16000, dtype=torch.float32), method="silero")  # 1s at 16kHz (Whisper SAMPLE_RATE)
+    print("Done.")
+
     output_files = {'json': {}, 'srt': {}, 'csv': {}}
+    first_file_timed = True
     # Process each video file
     for video_file in video_files:
         print(f"\nProcessing: {video_file.name}")
-        # Generate output filenames
         base_name = video_file.stem
 
-
         ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
-        # DD-MMM-YYYY, followed by an underscore, followed by the starttime HHhMMmSS.XXXXs
         edf_compatible_name = build_EDF_compatible_video_filename(video_file.name)
         print(f'\tedf_compatible_name: "{edf_compatible_name}"')
         edf_compatible_path = alias_dir / edf_compatible_name
         if not edf_compatible_path.exists():
             edf_compatible_path.symlink_to(video_file.resolve())
 
-        ## check if its outputs exist already
         found_output_files: List[Path] = find_extant_output_files(output_dir=output_dir, base_name=base_name)
         if found_output_files:
             print(f"  ✗ Skipping {video_file.name} as its outputs already exist: {found_output_files}")
             continue
-        else:
-            try:
-                # Load audio from video file
-                audio = whisper.load_audio(str(video_file))
-                
-                # audio_speech, segments, convert_timestamps = remove_non_speech(audio, vad="silero")
-                
-                # Transcribe with timestamps
-                result = whisper.transcribe(
-                    model, 
-                    audio, 
-                    language="en",
-                    vad="silero",
-                    # vad="auditok",
-                    remove_empty_words=True,
-                    # seed=1337,
-                    # verbose=True,
-                )
-                
-                # Generate output filenames
-                base_name = video_file.stem
-                curr_output_files_dict = write_results(result, output_dir=output_dir, base_name=base_name)
-                ## add outputted files to the output_files dict
-                for k, curr_out_files_dict in curr_output_files_dict.items():
-                    if k not in output_files:
-                        output_files[k] = dict() ## initialize a new dict
-                    output_files[k].update(**curr_out_files_dict)
-                
-            except Exception as e:
-                print(f"  ✗ Error processing {video_file.name}: {str(e)}")
-                continue
+        try:
+            if first_file_timed:
+                print("  Running VAD and transcription...")
+            print("  Loading audio...")
+            t0_audio = time.perf_counter()
+            audio = whisper.load_audio(str(video_file))
+            print("  Audio loaded.")
+            if first_file_timed:
+                print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
+
+            t0_transcribe = time.perf_counter()
+            result = whisper.transcribe(model, audio, language="en", vad="silero", remove_empty_words=True)
+            if first_file_timed:
+                print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")
+                first_file_timed = False
+
+            base_name = video_file.stem
+            curr_output_files_dict = write_results(result, output_dir=output_dir, base_name=base_name)
+            for k, curr_out_files_dict in curr_output_files_dict.items():
+                if k not in output_files:
+                    output_files[k] = dict()
+                output_files[k].update(**curr_out_files_dict)
+
+        except Exception as e:
+            print(f"  ✗ Error processing {video_file.name}: {str(e)}")
+            continue
             
     print(f"\nProcessing complete! Output files saved to: {output_dir.resolve()}")
     return output_files
@@ -280,7 +273,7 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
 
 if __name__ == "__main__":
     # Format(s) of the output file(s). Possible formats are: txt, vtt, srt, tsv, csv, json. Several formats can be specified by using commas (ex: "json,vtt,srt"). By default ("all"), all available formats  
-    recordings_dir = Path(r"M:\ScreenRecordings\EyeTrackerVR_Recordings").resolve()
+    recordings_dir = Path(r"M:\ScreenRecordings\EyeTrackerVR_Recordings").resolve() # Debut_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%
     # video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']
     video_extensions = ['.mp4']
     output_files = process_recordings(recordings_dir=recordings_dir, video_extensions=video_extensions)

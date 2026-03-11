@@ -10,6 +10,11 @@ except Exception as e:  # pragma: no cover
     Observer = None
     FileSystemEventHandler = object  # type: ignore
 
+import sys
+scripts_dir = Path(__file__).parent.parent / "scripts"
+if str(scripts_dir.resolve()) not in sys.path:
+    sys.path.append(str(scripts_dir.resolve()))
+
 from process_recordings import process_recordings
 
 

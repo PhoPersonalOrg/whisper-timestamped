@@ -9,9 +9,9 @@ import mne
 from datetime import datetime, timedelta
 from pathlib import Path
 import json
-from parse_video_filename import parse_video_filename
+from whisper_timestamped.parse_video_filename import parse_video_filename
 from typing import List, Dict, Tuple, Optional, Union
-from process_recordings import find_extant_output_files, write_results, process_recordings
+# from process_recordings import find_extant_output_files, write_results, process_recordings
 
 class VideoTranscriptToLabStreamingLayer:
     """
