@@ -138,3 +138,5 @@ desktop.ini
 .pseudo-folders.backup.1.json
 desktop.ini
 .pseudo-folders*.json
+.specstory
+**.cursorindexingignore*
