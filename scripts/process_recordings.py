@@ -224,23 +224,23 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
 
     output_files = {'json': {}, 'srt': {}, 'csv': {}}
     first_file_timed = True
+    failed_files: List[Path] = []
     # Process each video file
     for video_file in video_files:
         print(f"\nProcessing: {video_file.name}")
         base_name = video_file.stem
-
-        ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
-        edf_compatible_name = build_EDF_compatible_video_filename(video_file.name)
-        print(f'\tedf_compatible_name: "{edf_compatible_name}"')
-        edf_compatible_path = alias_dir / edf_compatible_name
-        if not edf_compatible_path.exists():
-            edf_compatible_path.symlink_to(video_file.resolve())
-
-        found_output_files: List[Path] = find_extant_output_files(output_dir=output_dir, base_name=base_name)
-        if found_output_files:
-            print(f"  ✗ Skipping {video_file.name} as its outputs already exist: {found_output_files}")
-            continue
         try:
+            ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
+            edf_compatible_name = build_EDF_compatible_video_filename(video_file.name)
+            print(f'\tedf_compatible_name: "{edf_compatible_name}"')
+            edf_compatible_path = alias_dir / edf_compatible_name
+            if not edf_compatible_path.exists():
+                edf_compatible_path.symlink_to(video_file.resolve())
+
+            found_output_files: List[Path] = find_extant_output_files(output_dir=output_dir, base_name=base_name)
+            if found_output_files:
+                print(f"  ✗ Skipping {video_file.name} as its outputs already exist: {found_output_files}")
+                continue
             if first_file_timed:
                 print("  Running VAD and transcription...")
             print("  Loading audio...")
@@ -264,9 +264,12 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
                 output_files[k].update(**curr_out_files_dict)
 
         except Exception as e:
-            print(f"  ✗ Error processing {video_file.name}: {str(e)}")
+            failed_files.append(video_file)
+            print(f"  ✗ Error processing {video_file.name}: [{type(e).__name__}] {e}")
             continue
-            
+
+    if failed_files:
+        print(f"\nProcessing complete with {len(failed_files)} failed file(s): {[f.name for f in failed_files]}")
     print(f"\nProcessing complete! Output files saved to: {output_dir.resolve()}")
     return output_files
 
