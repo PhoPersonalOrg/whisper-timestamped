@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -23,14 +24,19 @@ try:
     TORCH_AVAILABLE = True
 except Exception:
     TORCH_AVAILABLE = False
-
-from faster_whisper import WhisperModel
+    torch = None
 
 try:
     from pylsl import StreamInfo, StreamOutlet
     LSL_AVAILABLE = True
 except Exception:
     LSL_AVAILABLE = False
+
+
+def _startup_mark(label: str, since: float) -> None:
+    if os.environ.get("PHOLOG_STARTUP_TIMING", "").lower() not in ("1", "true", "yes"):
+        return
+    print(f"[startup] {label}: {time.perf_counter() - since:.3f}s", flush=True)
 
 
 @dataclass
@@ -100,17 +106,16 @@ class RingBuffer:
 class LiveTranscriber:
     def __init__(self, cfg: LiveConfig):
         self.cfg = cfg
-        # Auto device/compute_type selection
-        if self.cfg.device is None:
-            self.cfg.device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
-        if self.cfg.compute_type is None:
-            self.cfg.compute_type = "float16" if self.cfg.device == "cuda" else "int8"
+        # Resolve auto (None) without mutating cfg so GUI settings keep device/compute_type as None
+        self._resolved_device = cfg.device or ("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
+        self._resolved_compute_type = cfg.compute_type or ("float16" if self._resolved_device == "cuda" else "int8")
 
-        self.model = WhisperModel(
-            self.cfg.model,
-            device=self.cfg.device,
-            compute_type=self.cfg.compute_type,
-        )
+        _t_import = time.perf_counter()
+        from faster_whisper import WhisperModel
+        _startup_mark("import faster_whisper", _t_import)
+        _t_model = time.perf_counter()
+        self.model = WhisperModel(self.cfg.model, device=self._resolved_device, compute_type=self._resolved_compute_type)
+        _startup_mark(f"WhisperModel({self.cfg.model!r}) construct", _t_model)
 
         self.recording_start_time = datetime.now()
         self._stop_event = threading.Event()
@@ -378,7 +383,7 @@ def cli(argv: Optional[List[str]] = None):
 
     lt = LiveTranscriber(cfg)
     print(
-        f"Starting live transcription -> JSONL: {lt.jsonl_path.as_posix()} WAV: {lt.wav_path.as_posix() if cfg.write_audio_wav else '(disabled)'} | device={lt.cfg.device} compute_type={lt.cfg.compute_type}"
+        f"Starting live transcription -> JSONL: {lt.jsonl_path.as_posix()} WAV: {lt.wav_path.as_posix() if cfg.write_audio_wav else '(disabled)'} | device={lt._resolved_device} compute_type={lt._resolved_compute_type}"
     )
     try:
         lt.start()
