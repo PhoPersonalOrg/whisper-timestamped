@@ -276,8 +276,9 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
 
 if __name__ == "__main__":
     # Format(s) of the output file(s). Possible formats are: txt, vtt, srt, tsv, csv, json. Several formats can be specified by using commas (ex: "json,vtt,srt"). By default ("all"), all available formats  
-    recordings_dir = Path(r"M:\ScreenRecordings\EyeTrackerVR_Recordings").resolve() # Debut_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%
+    # recordings_dir = Path(r"M:\ScreenRecordings\EyeTrackerVR_Recordings").resolve() # Debut_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%
+    recordings_dir = Path(r"I:/ScreenRecordings/REC_continuous_video_recorder").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
     # video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']
-    video_extensions = ['.mp4']
+    video_extensions = ['.mp4', '.mkv']
     output_files = process_recordings(recordings_dir=recordings_dir, video_extensions=video_extensions)
     print(f'All processing complete! output_files: {output_files}\n\ndone.')
