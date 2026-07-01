@@ -1,6 +1,6 @@
 [project]
 name = "whisper-timestamped"
-version = "0.2.6"
+version = "0.2.7"
 description = "Multi-lingual Automatic Speech Recognition (ASR) based on Whisper models, with accurate word timestamps, access to language detection confidence, several options for Voice Activity Detection (VAD), and more."
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
@@ -110,7 +110,7 @@ package = true
 
 [tool.uv.sources]
 openai-whisper = { git = "https://github.com/openai/whisper.git" }
-phopylslhelper = { path = "../PhoPyLSLhelper", editable = true }
+phopylslhelper = { git = "https://github.com/PhoPersonalOrg/phopylslhelper.git", rev='develop' }
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

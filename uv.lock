@@ -1138,23 +1138,13 @@ wheels = [
 [[package]]
 name = "phopylslhelper"
 version = "1.0.6"
-source = { editable = "../PhoPyLSLhelper" }
+source = { git = "https://github.com/PhoPersonalOrg/phopylslhelper.git?rev=develop#2814c90a6738012cba6acd5bced96c17847d133d" }
 dependencies = [
     { name = "attrs" },
     { name = "pandas" },
     { name = "pylsl" },
     { name = "pytz" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "attrs", specifier = ">=22.2.0,<23" },
-    { name = "opencv-python", marker = "extra == 'video'", specifier = ">=4.5.0" },
-    { name = "pandas", specifier = ">=1.5.3,<3.0.0" },
-    { name = "pylsl", specifier = ">=1.16.2" },
-    { name = "pytz", specifier = ">=2025.2" },
-]
-provides-extras = ["video"]
 
 [[package]]
 name = "pillow"
@@ -4515,7 +4505,7 @@ wheels = [
 
 [[package]]
 name = "whisper-timestamped"
-version = "0.2.6"
+version = "0.2.7"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },
@@ -4618,7 +4608,7 @@ requires-dist = [
     { name = "onnxruntime", marker = "(platform_machine != 'x86_64' and extra == 'vad-silero') or (sys_platform != 'darwin' and extra == 'vad-silero')", specifier = ">=1.22.1,<1.23" },
     { name = "openai-whisper", git = "https://github.com/openai/whisper.git" },
     { name = "pandas", specifier = ">=2.3.1" },
-    { name = "phopylslhelper", editable = "../PhoPyLSLhelper" },
+    { name = "phopylslhelper", git = "https://github.com/PhoPersonalOrg/phopylslhelper.git?rev=develop" },
     { name = "pyautogui", specifier = ">=0.9.54" },
     { name = "pyinstaller", specifier = ">=6.15.0" },
     { name = "pylsl", specifier = ">=1.17.6" },

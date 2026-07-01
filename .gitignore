@@ -140,3 +140,6 @@ desktop.ini
 .pseudo-folders*.json
 .specstory
 **.cursorindexingignore*
+
+# uv-deps-switcher
+**/templating/uv_deps_switcher/backups
