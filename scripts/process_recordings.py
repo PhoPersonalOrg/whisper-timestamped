@@ -239,11 +239,14 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
         base_name = video_file.stem
         try:
             ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
-            edf_compatible_name = build_EDF_compatible_video_filename(video_file.name)
-            print(f'\tedf_compatible_name: "{edf_compatible_name}"')
-            edf_compatible_path = alias_dir / edf_compatible_name
-            if not edf_compatible_path.exists():
-                edf_compatible_path.symlink_to(video_file.resolve())
+            try:
+                edf_compatible_name = build_EDF_compatible_video_filename(video_file.name)
+                print(f'\tedf_compatible_name: "{edf_compatible_name}"')
+                edf_compatible_path = alias_dir / edf_compatible_name
+                if not edf_compatible_path.exists():
+                    edf_compatible_path.symlink_to(video_file.resolve())
+            except (ValueError, OSError) as e:
+                print(f"  ~ Skipping EDF alias for {video_file.name}: {e}")
 
             found_output_files: List[Path] = find_extant_output_files(output_dir=output_dir, base_name=base_name)
             if found_output_files:
@@ -285,8 +288,17 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
 if __name__ == "__main__":
     # Format(s) of the output file(s). Possible formats are: txt, vtt, srt, tsv, csv, json. Several formats can be specified by using commas (ex: "json,vtt,srt"). By default ("all"), all available formats  
     # recordings_dir = Path(r"M:\ScreenRecordings\EyeTrackerVR_Recordings").resolve() # Debut_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%
-    recordings_dir = Path(r"I:/ScreenRecordings/REC_continuous_video_recorder").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
-    # video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']
-    video_extensions = ['.mp4', '.mkv']
-    output_files = process_recordings(recordings_dir=recordings_dir, video_extensions=video_extensions)
+    # recordings_dir = Path(r"I:/ScreenRecordings/REC_continuous_video_recorder").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
+    # output_dir = None
+    # # video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']
+    # video_extensions = ['.mp4', '.mkv']
+
+
+    #TODO 2026-09-24 11:55: - [ ] audio recordings from WhisperApp audio exports
+    recordings_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
+    output_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
+    video_extensions = ['.m4a']
+
+    output_files = process_recordings(recordings_dir=recordings_dir, output_dir=output_dir, video_extensions=video_extensions)
     print(f'All processing complete! output_files: {output_files}\n\ndone.')
+
