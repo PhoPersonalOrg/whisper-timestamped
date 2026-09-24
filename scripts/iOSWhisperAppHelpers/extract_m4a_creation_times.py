@@ -1,7 +1,12 @@
 """
 Extract embedded m4a creation_time (UTC -> local) into a file-list CSV.
 
-Adds/overwrites column `extracted_creation_time` using ffprobe format tags.
+Adds/overwrites columns:
+  - extracted_creation_time
+  - duration (seconds)
+  - duration_hms
+
+Duration fields are optional: missing values leave empty cells (no failure).
 
 Example:
 ```bash
@@ -27,7 +32,9 @@ DEFAULT_CSV_PATH = Path(
 )
 DEFAULT_AUDIO_DIR = Path(r"H:\backups\2026-09-21_iPhone15Pro\WhisperApp\Audio")
 DEFAULT_TZ = "America/Los_Angeles"
-COLUMN_NAME = "extracted_creation_time"
+COL_CREATION = "extracted_creation_time"
+COL_DURATION_SEC = "duration (seconds)"
+COL_DURATION_HMS = "duration_hms"
 
 
 def resolve_audio_path(
@@ -52,8 +59,14 @@ def resolve_audio_path(
     return None
 
 
-def probe_creation_time_utc(path: Path) -> Optional[datetime]:
-    """Return embedded creation_time as timezone-aware UTC datetime, or None."""
+def probe_format_metadata(
+    path: Path,
+) -> Tuple[Optional[datetime], Optional[float]]:
+    """
+    Return (creation_time_utc, duration_seconds) from ffprobe format JSON.
+
+    Either field may be None if missing or unparseable; never raises for that.
+    """
     try:
         out = subprocess.check_output(
             [
@@ -69,21 +82,31 @@ def probe_creation_time_utc(path: Path) -> Optional[datetime]:
         )
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"  ! ffprobe failed for {path.name}: {exc}")
-        return None
+        return None, None
 
     fmt = json.loads(out).get("format") or {}
     tags = fmt.get("tags") or {}
-    raw = tags.get("creation_time")
-    if not raw:
-        return None
 
-    # ffprobe typically returns e.g. 2026-07-10T02:57:31.000000Z
-    cleaned = str(raw).strip().replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(cleaned)
-    except ValueError:
-        print(f"  ! Unparseable creation_time for {path.name}: {raw!r}")
-        return None
+    utc_dt: Optional[datetime] = None
+    raw_ct = tags.get("creation_time")
+    if raw_ct:
+        cleaned = str(raw_ct).strip().replace("Z", "+00:00")
+        try:
+            utc_dt = datetime.fromisoformat(cleaned)
+        except ValueError:
+            print(f"  ! Unparseable creation_time for {path.name}: {raw_ct!r}")
+    ## END if raw_ct....
+
+    duration_sec: Optional[float] = None
+    raw_dur = fmt.get("duration")
+    if raw_dur is not None and str(raw_dur).strip() != "":
+        try:
+            duration_sec = float(raw_dur)
+        except (TypeError, ValueError):
+            print(f"  ! Unparseable duration for {path.name}: {raw_dur!r}")
+    ## END if raw_dur....
+
+    return utc_dt, duration_sec
 
 
 def utc_to_local_str(utc_dt: datetime, tz_name: str) -> str:
@@ -94,57 +117,90 @@ def utc_to_local_str(utc_dt: datetime, tz_name: str) -> str:
     return local.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_duration_seconds(duration_sec: float) -> str:
+    return f"{duration_sec:.3f}"
+
+
+def format_duration_hms(duration_sec: float) -> str:
+    total = int(duration_sec)  # floor
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    seconds = total % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def extract_for_csv(
     csv_path: Path,
     output_path: Path,
     audio_dir: Path,
     tz_name: str,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, int]:
     """
-    Probe each row and write CSV with extracted_creation_time.
+    Probe each row and write CSV with creation_time + optional duration columns.
 
-    Returns (probed, succeeded, missing_tag, missing_file).
+    Returns (probed, creation_ok, duration_ok, missing_file, ffprobe_fail).
     """
     df = pd.read_csv(csv_path)
-    extracted: list[str] = []
+    creations: list[str] = []
+    durations_sec: list[str] = []
+    durations_hms: list[str] = []
     probed = 0
-    succeeded = 0
-    missing_tag = 0
+    creation_ok = 0
+    duration_ok = 0
     missing_file = 0
+    ffprobe_fail = 0
 
     for _, row in df.iterrows():
         path = resolve_audio_path(row, audio_dir)
         if path is None:
             name = row.get("name", "?")
             print(f"  ! Missing file for row name={name!r}")
-            extracted.append("")
+            creations.append("")
+            durations_sec.append("")
+            durations_hms.append("")
             missing_file += 1
             continue
         ## END if path is None....
 
         probed += 1
-        utc_dt = probe_creation_time_utc(path)
-        if utc_dt is None:
-            extracted.append("")
-            missing_tag += 1
-            continue
-        ## END if utc_dt is None....
+        utc_dt, duration_sec = probe_format_metadata(path)
 
-        extracted.append(utc_to_local_str(utc_dt, tz_name))
-        succeeded += 1
+        if utc_dt is None and duration_sec is None:
+            # Likely ffprobe failure or empty format; count once when both absent
+            # after a successful path resolve (probe already logged on failure).
+            ffprobe_fail += 1
+
+        if utc_dt is not None:
+            creations.append(utc_to_local_str(utc_dt, tz_name))
+            creation_ok += 1
+        else:
+            creations.append("")
+        ## END if utc_dt....
+
+        if duration_sec is not None:
+            durations_sec.append(format_duration_seconds(duration_sec))
+            durations_hms.append(format_duration_hms(duration_sec))
+            duration_ok += 1
+        else:
+            durations_sec.append("")
+            durations_hms.append("")
+        ## END if duration_sec....
     ## END for _, row in df.iterrows()....
 
-    df[COLUMN_NAME] = extracted
+    df[COL_CREATION] = creations
+    df[COL_DURATION_SEC] = durations_sec
+    df[COL_DURATION_HMS] = durations_hms
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8")
-    return probed, succeeded, missing_tag, missing_file
+    return probed, creation_ok, duration_ok, missing_file, ffprobe_fail
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract embedded m4a creation_time (UTC -> local) into "
-            f"column '{COLUMN_NAME}' on a file-list CSV."
+            "Extract embedded m4a creation_time (UTC -> local) and optional "
+            f"duration columns into a file-list CSV "
+            f"({COL_CREATION}, {COL_DURATION_SEC!r}, {COL_DURATION_HMS})."
         )
     )
     parser.add_argument(
@@ -184,7 +240,7 @@ def main() -> None:
     print(f"Output: {output_path}")
     print(f"TZ:     {args.tz}")
 
-    probed, succeeded, missing_tag, missing_file = extract_for_csv(
+    probed, creation_ok, duration_ok, missing_file, ffprobe_fail = extract_for_csv(
         csv_path=csv_path,
         output_path=output_path,
         audio_dir=args.audio_dir,
@@ -192,8 +248,8 @@ def main() -> None:
     )
 
     print(
-        f"Done. probed={probed} succeeded={succeeded} "
-        f"missing_tag={missing_tag} missing_file={missing_file} -> {output_path}"
+        f"Done. probed={probed} creation_ok={creation_ok} duration_ok={duration_ok} "
+        f"missing_file={missing_file} ffprobe_fail={ffprobe_fail} -> {output_path}"
     )
 
 
