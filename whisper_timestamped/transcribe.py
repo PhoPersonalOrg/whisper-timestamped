@@ -102,6 +102,10 @@ def transcribe_timestamped(
     trust_whisper_timestamps=TRUST_WHISPER_TIMESTAMP_BY_DEFAULT,
     naive_approach=False,
 
+    # Backend selection (None = infer from model object / default openai-whisper)
+    backend=None,
+    crisper_mode="verbatim",
+
     # Other Whisper options
     temperature=0.0 if USE_EFFICIENT_BY_DEFAULT else (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
     best_of=None,
@@ -224,6 +228,61 @@ def transcribe_timestamped(
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+    from whisper_timestamped.crisper_backend import (
+        is_crisper_model,
+        load_crisper_model,
+        transcribe_crisper,
+    )
+
+    # Resolve string model names (default remains openai-whisper)
+    if isinstance(model, str):
+        load_backend = backend or DEFAULT_BACKEND
+        if load_backend == "crisperwhisper":
+            model = load_crisper_model(model)
+        else:
+            model = load_model(model, backend=load_backend)
+
+    # Opt-in CrisperWhisper path: skip openai-whisper DTW alignment
+    if is_crisper_model(model):
+        vad = check_vad_method(vad)
+        convert_timestamps = None
+        vad_segments = None
+        if vad is not None:
+            audio = get_audio_tensor(audio)
+            audio, vad_segments, convert_timestamps = remove_non_speech(
+                audio,
+                method=vad,
+                sample_rate=SAMPLE_RATE,
+                plot=plot_word_alignment,
+                avoid_empty_speech=True,
+            )
+        transcription = transcribe_crisper(
+            model,
+            audio,
+            language=language,
+            crisper_mode=crisper_mode,
+            remove_punctuation_from_words=remove_punctuation_from_words,
+            verbose=verbose,
+        )
+        if convert_timestamps is not None:
+            for segment in transcription["segments"]:
+                for word in segment.get("words", []):
+                    word["start"], word["end"] = convert_timestamps(
+                        word["start"], word["end"]
+                    )
+                if segment.get("words"):
+                    segment["start"] = segment["words"][0]["start"]
+                    segment["end"] = segment["words"][-1]["end"]
+                else:
+                    segment["start"], segment["end"] = convert_timestamps(
+                        segment["start"], segment["end"]
+                    )
+        if vad_segments is not None:
+            transcription["speech_activity"] = [
+                {"start": s, "end": e} for (s, e) in vad_segments
+            ]
+        return transcription
+
     # Check input options
     assert refine_whisper_precision >= 0 and refine_whisper_precision / AUDIO_TIME_PER_TOKEN == round(refine_whisper_precision / AUDIO_TIME_PER_TOKEN), f"refine_whisper_precision must be a positive multiple of {AUDIO_TIME_PER_TOKEN}"
     refine_whisper_precision_nframes = round(refine_whisper_precision / AUDIO_TIME_PER_TOKEN)
@@ -246,8 +305,6 @@ def transcribe_timestamped(
 
     # Input options
     vad = check_vad_method(vad)
-    if isinstance(model, str):
-        model = load_model(model)
     if fp16 is None:
         fp16 = model.device != torch.device("cpu")
 
@@ -2424,12 +2481,17 @@ def load_model(
     device : str or torch.device, optional
         Device to use. If None, use CUDA if there is a GPU available, otherwise CPU.
     backend : str, optional
-        Backend to use. Either "transformers" or "openai-whisper".
+        Backend to use. One of "openai-whisper" (default), "transformers",
+        or "crisperwhisper" (vendored CrisperWhisper transformers path).
     download_root : str, optional
         Root folder to download the model to. If None, use the default download root (typically: ~/.cache)
     in_memory : bool, optional
         Whether to preload the model weights into host memory.
     """
+    if backend == "crisperwhisper":
+        from whisper_timestamped.crisper_backend import load_crisper_model
+        return load_crisper_model(name, device=device)
+
     if backend == "transformers":
         try:
             import transformers
@@ -3010,7 +3072,8 @@ def cli():
     parser.add_argument('--model', help=f"name of the Whisper model to use. Examples: {', '.join(whisper.available_models())}", default="small")
     parser.add_argument("--model_dir", default=None, help="the path to save model files; uses ~/.cache/whisper by default", type=str)
     parser.add_argument("--device", default=get_default_device(), help="device to use for PyTorch inference")
-    parser.add_argument("--backend", default=DEFAULT_BACKEND, help="Which backend to use", choices=["openai-whisper", "transformers"], type=str)
+    parser.add_argument("--backend", default=DEFAULT_BACKEND, help="Which backend to use", choices=["openai-whisper", "transformers", "crisperwhisper"], type=str)
+    parser.add_argument("--crisper_mode", default="verbatim", help="CrisperWhisper transcription mode (backend=crisperwhisper only)", choices=["verbatim", "intended"], type=str)
     parser.add_argument("--output_dir", "-o", default=None, help="directory to save the outputs", type=str)
     valid_formats = ["txt", "vtt", "srt", "tsv", "csv", "json"]
     def str2output_formats(string):

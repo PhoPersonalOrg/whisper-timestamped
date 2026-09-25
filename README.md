@@ -170,6 +170,37 @@ model = whisper.load_model("NbAiLab/whisper-large-v2-nob", device="cpu")
 # ...
 ```
 
+### Optional CrisperWhisper backend
+
+For higher-quality verbatim (or intended) transcription with precise word timings,
+an optional **CrisperWhisper 2.0** mode is available. Inference code is vendored
+under `whisper_timestamped/crisperwhisper` (MIT). Model weights are separate and
+released by Nyra under a [non-commercial research license](https://huggingface.co/nyralabs/CrisperWhisper2.0_large/blob/main/LICENSE.md);
+commercial use of the weights requires a commercial license from Nyra.
+
+Default `openai-whisper` behavior is unchanged. Enable the mode explicitly:
+
+```python
+import whisper_timestamped as whisper
+
+model = whisper.load_model("small", backend="crisperwhisper", device="cpu")
+result = whisper.transcribe(model, "AUDIO.wav", language="en", crisper_mode="verbatim")
+# result shape matches the usual {text, language, segments[].words[]} schema
+```
+
+Or on the CLI:
+
+```bash
+whisper_timestamped AUDIO.wav --backend crisperwhisper --model small --crisper_mode verbatim
+```
+
+Shorthand model names for this backend: `small`, `medium`, `turbo`, `large`, and
+the corresponding `*_pro` variants (or a full HuggingFace id / local path).
+Stock Whisper sizes such as `tiny` / `large-v2` are rejected with a clear error.
+On Windows this path uses the PyTorch / transformers backend only (the
+CTranslate2 fork used upstream by CrisperWhisper is Linux-only and conflicts
+with `faster-whisper`).
+
 ### Command line
 
 You can also use `whisper_timestamped` on the command line, similarly to `whisper`. See help with:
@@ -536,7 +567,8 @@ Load a Whisper model from a given name or path.
   Device to use. If None, use CUDA if available, otherwise CPU.
 
 - `backend`: str, default "openai-whisper"
-  Backend to use. Either "transformers" or "openai-whisper".
+  Backend to use. One of `"openai-whisper"`, `"transformers"`, or
+  `"crisperwhisper"` (vendored CrisperWhisper transformers path).
 
 - `download_root`: str, optional (default: None)
   Root folder to download the model to. If None, use the default download root.
