@@ -185,7 +185,15 @@ def write_results(result, output_dir: Path, base_name: str, output_formats = ['j
     return output_files
 
 
-def process_recordings(recordings_dir: Path, output_dir=None, video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v'], model_path_root: Path = Path(r'F:\AITEMP\whisper_models')):
+def process_recordings(
+    recordings_dir: Path,
+    output_dir=None,
+    video_extensions=['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v'],
+    model_path_root: Path = Path(r'F:\AITEMP\whisper_models'),
+    backend: str = "openai-whisper",
+    model_name: str = None,
+    crisper_mode: str = "verbatim",
+):
     # Define the recordings directory
     if isinstance(recordings_dir, str):
         recordings_dir = Path(recordings_dir).resolve()
@@ -216,13 +224,25 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
     print(f"Found {len(video_files)} video files to process")
 
     # Load the model once (after file discovery so progress is visible sooner)
+    if model_name is None:
+        model_name = "medium" if backend == "crisperwhisper" else "medium.en"
     model_path_root = model_path_root.resolve()
-    assert model_path_root.exists()
-    model_name: str = "medium.en"
+    # CrisperWhisper weights come from HuggingFace cache, not model_path_root.
+    if backend != "crisperwhisper":
+        assert model_path_root.exists()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading Whisper model at model_path_root: '{model_path_root.as_posix()}' (device={device})...")
+    print(
+        f"Loading Whisper model {model_name!r} (backend={backend}, device={device}"
+        + (f", model_path_root='{model_path_root.as_posix()}'" if backend != "crisperwhisper" else "")
+        + ")..."
+    )
     t0_model = time.perf_counter()
-    model = whisper.load_model(model_name, download_root=str(model_path_root), device=device)
+    model = whisper.load_model(
+        model_name,
+        download_root=str(model_path_root),
+        device=device,
+        backend=backend,
+    )
     print(f"Whisper model loaded. (Model load: {time.perf_counter() - t0_model:.1f}s)")
 
     # Preload Silero VAD so first-file transcribe does not stall with no progress
@@ -262,7 +282,14 @@ def process_recordings(recordings_dir: Path, output_dir=None, video_extensions =
                 print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
 
             t0_transcribe = time.perf_counter()
-            result = whisper.transcribe(model, audio, language="en", vad="silero", remove_empty_words=True)
+            result = whisper.transcribe(
+                model,
+                audio,
+                language="en",
+                vad="silero",
+                remove_empty_words=True,
+                crisper_mode=crisper_mode,
+            )
             if first_file_timed:
                 print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")
                 first_file_timed = False
@@ -299,6 +326,13 @@ if __name__ == "__main__":
     output_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
     video_extensions = ['.m4a']
 
-    output_files = process_recordings(recordings_dir=recordings_dir, output_dir=output_dir, video_extensions=video_extensions)
+    output_files = process_recordings(
+        recordings_dir=recordings_dir,
+        output_dir=output_dir,
+        video_extensions=video_extensions,
+        backend="crisperwhisper",
+        model_name="medium",
+        crisper_mode="verbatim",
+    )
     print(f'All processing complete! output_files: {output_files}\n\ndone.')
 
