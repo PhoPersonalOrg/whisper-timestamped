@@ -143,3 +143,4 @@ desktop.ini
 
 # uv-deps-switcher
 **/templating/uv_deps_switcher/backups
+scripts/m4a_file_list.csv
