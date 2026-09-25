@@ -265,6 +265,19 @@ wheels = [
 ]
 
 [[package]]
+name = "ctranslate2-crisperwhisper"
+version = "4.7.1.post3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "pyyaml", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "setuptools", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/ab/f0a5545448531c712275fb47a72a899fa6ca603858049c22b6d30af35f02/ctranslate2_crisperwhisper-4.7.1.post3-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bed20ef640c45158ace6b579da94fc7001929fa2d4c69c765e0aa29711dcc82a", size = 40116771, upload-time = "2026-07-15T10:59:41.291Z" },
+]
+
+[[package]]
 name = "cuda-bindings"
 version = "13.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1032,6 +1045,18 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cublas-cu12"
+version = "12.9.2.10"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cuda-nvrtc-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f7/a2/c96163a0fff1839c0c9548bbdeae7b853b867009e33b9b9264adc238b1cf/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:5572131a59c3eebeeb1c4c8144f772d49372c20124916e072a0e3fc30df421d5", size = 575012079, upload-time = "2026-04-08T18:51:47.303Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/c0/0a517bfe63ccd3b92eb254d264e28fca3c7cab75d07daea315250fb1bf73/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:e4f53a8ca8c5d6e8c492d0d0a3d565ecb59a751b19cfdaa4f6da0ab2104c1702", size = 581240110, upload-time = "2026-04-08T18:52:31.532Z" },
+]
+
+[[package]]
 name = "nvidia-cuda-cupti"
 version = "13.0.85"
 source = { registry = "https://pypi.org/simple" }
@@ -1047,6 +1072,15 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c3/68/483a78f5e8f31b08fb1bb671559968c0ca3a065ac7acabfc7cee55214fd6/nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575", size = 90215200, upload-time = "2025-09-04T08:28:44.204Z" },
     { url = "https://files.pythonhosted.org/packages/b7/dc/6bb80850e0b7edd6588d560758f17e0550893a1feaf436807d64d2da040f/nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d27f20a0ca67a4bb34268a5e951033496c5b74870b868bacd046b1b8e0c3267b", size = 43015449, upload-time = "2025-09-04T08:28:20.239Z" },
+]
+
+[[package]]
+name = "nvidia-cuda-nvrtc-cu12"
+version = "12.9.86"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/85/e4af82cc9202023862090bfca4ea827d533329e925c758f0cde964cb54b7/nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:210cf05005a447e29214e9ce50851e83fc5f4358df8b453155d5e1918094dcb4", size = 89568129, upload-time = "2025-06-05T20:02:41.973Z" },
+    { url = "https://files.pythonhosted.org/packages/64/eb/c2295044b8f3b3b08860e2f6a912b702fc92568a167259df5dddb78f325e/nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:096d4de6bda726415dfaf3198d4f5c522b8e70139c97feef5cd2ca6d4cd9cead", size = 44528905, upload-time = "2025-06-05T20:02:29.754Z" },
 ]
 
 [[package]]
@@ -4689,7 +4723,7 @@ dependencies = [
     { name = "auditok" },
     { name = "cython" },
     { name = "dtw-python" },
-    { name = "faster-whisper" },
+    { name = "faster-whisper", marker = "sys_platform == 'win32'" },
     { name = "huggingface-hub", extra = ["hf-xet"] },
     { name = "ipykernel" },
     { name = "keyboard" },
@@ -4722,6 +4756,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+crisper-ct2 = [
+    { name = "ctranslate2-crisperwhisper", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
+]
 dev = [
     { name = "matplotlib" },
     { name = "transformers" },
@@ -4768,9 +4806,10 @@ requires-dist = [
     { name = "attrs", specifier = ">=22.2.0,<23" },
     { name = "auditok", specifier = ">=0.3.0" },
     { name = "auditok", marker = "extra == 'vad-auditok'" },
+    { name = "ctranslate2-crisperwhisper", marker = "sys_platform == 'linux' and extra == 'crisper-ct2'", specifier = ">=4.7.1.post3,<5" },
     { name = "cython" },
     { name = "dtw-python" },
-    { name = "faster-whisper", specifier = ">=1.2.0" },
+    { name = "faster-whisper", marker = "sys_platform == 'win32'", specifier = ">=1.2.0" },
     { name = "faster-whisper", marker = "extra == 'full'", specifier = ">=1.0.0" },
     { name = "faster-whisper", marker = "extra == 'live'", specifier = ">=1.0.0" },
     { name = "huggingface-hub", extras = ["hf-xet"], specifier = ">=0.33.4" },
@@ -4782,6 +4821,7 @@ requires-dist = [
     { name = "mne", specifier = ">=1.10.0" },
     { name = "mne-lsl", specifier = ">=1.10.1" },
     { name = "numpy", specifier = ">=2.2.6" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux' and extra == 'crisper-ct2'" },
     { name = "onnxruntime", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = ">=1.22.1,<1.23" },
     { name = "onnxruntime", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = ">=1.16.1,<1.20.0" },
     { name = "onnxruntime", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'full'", specifier = ">=1.16.1,<1.20.0" },
@@ -4823,4 +4863,4 @@ requires-dist = [
     { name = "watchdog", marker = "extra == 'watch'", specifier = ">=4.0.0" },
     { name = "wheel", specifier = ">=0.45.1" },
 ]
-provides-extras = ["dev", "live", "realtimestt", "watch", "vad-silero", "vad-auditok", "test", "full"]
+provides-extras = ["dev", "live", "crisper-ct2", "realtimestt", "watch", "vad-silero", "vad-auditok", "test", "full"]

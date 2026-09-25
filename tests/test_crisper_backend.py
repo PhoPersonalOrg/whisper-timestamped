@@ -1,9 +1,11 @@
 """Unit tests for CrisperWhisper → whisper-timestamped result mapping (no model download)."""
 
 import unittest
+from unittest import mock
 
 from whisper_timestamped.crisper_backend import (
     map_crisper_result,
+    resolve_crisper_runtime,
     validate_crisper_model_name,
 )
 from whisper_timestamped.crisperwhisper.result import (
@@ -89,6 +91,25 @@ class TestCrisperBackendMapper(unittest.TestCase):
     def test_validate_accepts_crisper_shorthands(self):
         self.assertIn("CrisperWhisper2.0_small", validate_crisper_model_name("small"))
         self.assertIn("CrisperWhisper2.0_turbo", validate_crisper_model_name("turbo"))
+
+    def test_resolve_runtime_auto_without_fork(self):
+        with mock.patch(
+            "whisper_timestamped.crisper_backend.ct2_fork_available",
+            return_value=False,
+        ):
+            self.assertEqual(resolve_crisper_runtime("auto"), "transformers")
+            self.assertEqual(resolve_crisper_runtime("transformers"), "transformers")
+            with self.assertRaises(ImportError):
+                resolve_crisper_runtime("ct2")
+
+    def test_resolve_runtime_auto_with_fork(self):
+        with mock.patch(
+            "whisper_timestamped.crisper_backend.ct2_fork_available",
+            return_value=True,
+        ):
+            self.assertEqual(resolve_crisper_runtime("auto"), "ct2")
+            self.assertEqual(resolve_crisper_runtime("ct2"), "ct2")
+            self.assertEqual(resolve_crisper_runtime("transformers"), "transformers")
 
 
 if __name__ == "__main__":

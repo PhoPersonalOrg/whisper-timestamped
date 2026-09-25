@@ -193,6 +193,7 @@ def process_recordings(
     backend: str = "openai-whisper",
     model_name: str = None,
     crisper_mode: str = "verbatim",
+    crisper_runtime: str = "auto",
 ):
     # Define the recordings directory
     if isinstance(recordings_dir, str):
@@ -242,8 +243,15 @@ def process_recordings(
         download_root=str(model_path_root),
         device=device,
         backend=backend,
+        crisper_runtime=crisper_runtime,
     )
-    print(f"Whisper model loaded. (Model load: {time.perf_counter() - t0_model:.1f}s)")
+    runtime_note = ""
+    if backend == "crisperwhisper" and hasattr(model, "runtime"):
+        runtime_note = f" crisper_runtime={model.runtime!r}"
+    print(
+        f"Whisper model loaded.{runtime_note} "
+        f"(Model load: {time.perf_counter() - t0_model:.1f}s)"
+    )
 
     # Preload Silero VAD so first-file transcribe does not stall with no progress
     print("Loading Silero VAD...")
@@ -333,6 +341,7 @@ if __name__ == "__main__":
         backend="crisperwhisper",
         model_name="medium",
         crisper_mode="verbatim",
+        crisper_runtime="auto",  # CT2 on WSL2 with --extra crisper_ct2; transformers on Windows
     )
     print(f'All processing complete! output_files: {output_files}\n\ndone.')
 

@@ -197,9 +197,19 @@ whisper_timestamped AUDIO.wav --backend crisperwhisper --model small --crisper_m
 Shorthand model names for this backend: `small`, `medium`, `turbo`, `large`, and
 the corresponding `*_pro` variants (or a full HuggingFace id / local path).
 Stock Whisper sizes such as `tiny` / `large-v2` are rejected with a clear error.
-On Windows this path uses the PyTorch / transformers backend only (the
-CTranslate2 fork used upstream by CrisperWhisper is Linux-only and conflicts
-with `faster-whisper`).
+
+**Runtime (`--crisper_runtime` / `crisper_runtime=`):**
+- `auto` (default): use CTranslate2 when the CrisperWhisper CT2 fork is installed, else transformers.
+- `transformers`: PyTorch path (Windows-safe fallback).
+- `ct2`: force CTranslate2 + speculative decoding (Linux/WSL2 only).
+
+On **Windows**, `auto` selects transformers (no CT2 fork wheels). On **Linux/WSL2**, install the fast path with:
+
+```bash
+uv sync --extra crisper_ct2
+```
+
+Do **not** combine `crisper_ct2` with the `live` extra in the same environment — `faster-whisper` installs upstream `ctranslate2`, which clobbers the fork. First CT2 load converts weights once into `~/.cache/crisperwhisper/`.
 
 ### Command line
 

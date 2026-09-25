@@ -105,6 +105,7 @@ def transcribe_timestamped(
     # Backend selection (None = infer from model object / default openai-whisper)
     backend=None,
     crisper_mode="verbatim",
+    crisper_runtime="auto",
 
     # Other Whisper options
     temperature=0.0 if USE_EFFICIENT_BY_DEFAULT else (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
@@ -238,9 +239,13 @@ def transcribe_timestamped(
     if isinstance(model, str):
         load_backend = backend or DEFAULT_BACKEND
         if load_backend == "crisperwhisper":
-            model = load_crisper_model(model)
+            model = load_crisper_model(
+                model, crisper_runtime=crisper_runtime
+            )
         else:
-            model = load_model(model, backend=load_backend)
+            model = load_model(
+                model, backend=load_backend, crisper_runtime=crisper_runtime
+            )
 
     # Opt-in CrisperWhisper path: skip openai-whisper DTW alignment
     if is_crisper_model(model):
@@ -2465,6 +2470,7 @@ def load_model(
     backend: str = DEFAULT_BACKEND,
     download_root: str = None,
     in_memory: bool = False,
+    crisper_runtime: str = "auto",
 ):
     """
     Load a model from the given name or path.
@@ -2482,15 +2488,20 @@ def load_model(
         Device to use. If None, use CUDA if there is a GPU available, otherwise CPU.
     backend : str, optional
         Backend to use. One of "openai-whisper" (default), "transformers",
-        or "crisperwhisper" (vendored CrisperWhisper transformers path).
+        or "crisperwhisper" (vendored CrisperWhisper; CT2 on Linux when available).
     download_root : str, optional
         Root folder to download the model to. If None, use the default download root (typically: ~/.cache)
     in_memory : bool, optional
         Whether to preload the model weights into host memory.
+    crisper_runtime : str, optional
+        For backend="crisperwhisper": "auto" (CT2 fork if present, else transformers),
+        "ct2", or "transformers".
     """
     if backend == "crisperwhisper":
         from whisper_timestamped.crisper_backend import load_crisper_model
-        return load_crisper_model(name, device=device)
+        return load_crisper_model(
+            name, device=device, crisper_runtime=crisper_runtime
+        )
 
     if backend == "transformers":
         try:
@@ -3074,6 +3085,7 @@ def cli():
     parser.add_argument("--device", default=get_default_device(), help="device to use for PyTorch inference")
     parser.add_argument("--backend", default=DEFAULT_BACKEND, help="Which backend to use", choices=["openai-whisper", "transformers", "crisperwhisper"], type=str)
     parser.add_argument("--crisper_mode", default="verbatim", help="CrisperWhisper transcription mode (backend=crisperwhisper only)", choices=["verbatim", "intended"], type=str)
+    parser.add_argument("--crisper_runtime", default="auto", help="CrisperWhisper inference runtime: auto (CT2 on Linux/WSL if fork installed, else transformers), ct2, or transformers", choices=["auto", "ct2", "transformers"], type=str)
     parser.add_argument("--output_dir", "-o", default=None, help="directory to save the outputs", type=str)
     valid_formats = ["txt", "vtt", "srt", "tsv", "csv", "json"]
     def str2output_formats(string):
@@ -3168,8 +3180,15 @@ def cli():
 
     output_format = args.pop("output_format")
     backend = args.pop("backend")
+    crisper_runtime = args.pop("crisper_runtime")
 
-    model = load_model(model, device=device, download_root=model_dir, backend=backend)
+    model = load_model(
+        model,
+        device=device,
+        download_root=model_dir,
+        backend=backend,
+        crisper_runtime=crisper_runtime,
+    )
 
     plot_word_alignment = args.pop("plot")
 

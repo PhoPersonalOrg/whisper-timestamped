@@ -14,7 +14,10 @@ dependencies = [
     "auditok>=0.3.0",
     "cython",
     "dtw-python",
-    "faster-whisper>=1.2.0",
+    # Windows only in core: on Linux/WSL, faster-whisper pulls upstream
+    # ctranslate2 which clobbers ctranslate2-crisperwhisper (crisper_ct2 extra).
+    # Linux live users: uv sync --extra live
+    "faster-whisper>=1.2.0; sys_platform == 'win32'",
     "huggingface-hub[hf-xet]>=0.33.4",
     "ipykernel>=6.30.0",
     "keyboard>=0.13.5",
@@ -59,6 +62,13 @@ live = [
     "faster-whisper>=1.0.0",
     "sounddevice>=0.4.6",
     "soundfile>=0.12.1",
+]
+# CrisperWhisper CTranslate2 fork (Linux/WSL2 only). Do not combine with
+# the `live` extra in the same env — upstream ctranslate2 clobbers the fork.
+# WSL2 batch: uv sync --extra crisper_ct2
+crisper_ct2 = [
+    "ctranslate2-crisperwhisper>=4.7.1.post3,<5; sys_platform == 'linux'",
+    "nvidia-cublas-cu12; sys_platform == 'linux'",
 ]
 # RealtimeSTT pulls webrtcvad, which often fails to compile on Windows.
 # Install only when using whisper_timestamped.pho_launch_live_transcription.

@@ -60,20 +60,48 @@ _V1_FEATURE_WARNING = (
 )
 
 _BACKEND_MODULES = {
-    # Vendored copy ships transformers only; CT2 fork modules are omitted
-    # (they conflict with faster-whisper's upstream ctranslate2 on Windows).
     "ct2": ["ctranslate2", "whisper_timestamped.crisperwhisper.engine"],
     "transformers": ["torch", "transformers"],
 }
 
 
+_CT2_FORK_APIS = (
+    "prefill",
+    "forward_step",
+    "set_alignment_heads",
+    "generate_greedy_with_attention",
+)
+
+
+def _ct2_fork_apis_available() -> bool:
+    """True only for the CrisperWhisper CT2 fork, not upstream ctranslate2."""
+    import importlib.util
+
+    if importlib.util.find_spec("whisper_timestamped.crisperwhisper.engine") is None:
+        return False
+    try:
+        import ctranslate2
+    except ImportError:
+        return False
+    whisper_cls = getattr(ctranslate2.models, "Whisper", None)
+    if whisper_cls is None:
+        return False
+    return all(hasattr(whisper_cls, m) for m in _CT2_FORK_APIS)
+
+
 def _backend_available(backend: str) -> bool:
     import importlib.util
 
-    return all(
+    mods_ok = all(
         importlib.util.find_spec(m) is not None
         for m in _BACKEND_MODULES[backend]
     )
+    if not mods_ok:
+        return False
+    if backend == "ct2":
+        # Upstream ctranslate2 (faster-whisper) imports but lacks fork APIs.
+        return _ct2_fork_apis_available()
+    return True
 
 
 def _sanitize_suppress_tokens(
@@ -96,10 +124,12 @@ def _require_backend(backend: str) -> None:
     if not _backend_available(backend):
         if backend == "ct2":
             raise ImportError(
-                "The 'ct2' backend is not available in the vendored "
-                "CrisperWhisper copy inside whisper-timestamped (CTranslate2 "
-                "fork omitted to avoid clobbering faster-whisper). Use "
-                "backend='transformers' instead."
+                "The 'ct2' backend requires the CrisperWhisper CTranslate2 "
+                "fork on Linux/WSL2:\n"
+                "  uv sync --extra crisper_ct2\n"
+                "Do not install the 'live' extra in the same env (upstream "
+                "ctranslate2 from faster-whisper clobbers the fork). "
+                "On Windows use backend='transformers' instead."
             )
         raise ImportError(
             f"The '{backend}' backend requires "
@@ -283,12 +313,11 @@ class CrisperWhisperModel:
             return "transformers"
         if backend != "auto":
             return backend
-        # Prefer transformers: this vendored tree does not ship the CT2 fork
-        # modules, and upstream ctranslate2 (from faster-whisper) is not enough.
-        if _backend_available("transformers"):
-            return "transformers"
+        # Prefer CT2 only when the fork APIs are present (not upstream CT2).
         if _backend_available("ct2"):
             return "ct2"
+        if _backend_available("transformers"):
+            return "transformers"
         return "transformers"  # nothing installed: defer to a helpful error at init
 
     @property
