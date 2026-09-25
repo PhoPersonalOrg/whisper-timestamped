@@ -330,8 +330,12 @@ if __name__ == "__main__":
 
 
     #TODO 2026-09-24 11:55: - [ ] audio recordings from WhisperApp audio exports
-    recordings_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
-    output_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
+    # recordings_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
+    # output_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
+
+    recordings_dir = Path(r"/mnt/h/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
+    output_dir = Path(r"/mnt/h/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
+
     video_extensions = ['.m4a']
 
     output_files = process_recordings(
