@@ -5,7 +5,8 @@ Adds/overwrites columns:
   - extracted_creation_time
   - duration (seconds)
   - duration_hms
-  - is_duplicate (True when another row shares the same non-empty creation time)
+  - is_duplicate (True for non-keepers that share the same
+    extracted_creation_time + duration + size_mb; keeper is False)
 
 Also sets each media file's Windows "Date created" / Creation Time (the
 column sortable in Explorer) to the probed recording creation_time when present.
@@ -13,14 +14,18 @@ column sortable in Explorer) to the probed recording creation_time when present.
 If the input CSV is missing, builds it from --audio-dir (*.m4a, *.caf) and saves it
 before probing.
 
-After probing, flags creation-time duplicates (annotation only; does not
-delete or rename files) and prints each duplicate group.
+After probing, flags content duplicates that match on creation time, duration,
+and size_mb. Within each group, keeps the row with extracted_creation_time
+present and the longest duration; marks the rest as duplicates. Prints each
+duplicate group. Pass --move-duplicates to move non-keepers into
+--audio-dir/_DUP/ (created as needed).
 
 Duration fields are optional: missing values leave empty cells (no failure).
 
 Example:
 ```bash
 ./.venv/Scripts/python.exe scripts/iOSWhisperAppHelpers/extract_m4a_creation_times.py
+./.venv/Scripts/python.exe scripts/iOSWhisperAppHelpers/extract_m4a_creation_times.py --move-duplicates
 ```
 """
 
@@ -40,17 +45,19 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-DEFAULT_AUDIO_DIR = Path(r"H:\backups\2026-09-21_iPhone15Pro\WhisperApp\Audio")
+DEFAULT_AUDIO_DIR = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
 DEFAULT_TZ = "America/Los_Angeles"
 DEFAULT_CSV_PATH = (
-    Path(r"H:\backups\2026-09-21_iPhone15Pro\WhisperApp\filelists")
-    / f"{datetime.now(ZoneInfo(DEFAULT_TZ)).strftime('%Y-%m-%d')}_DEDUPE_audio_file_list.csv"
+    Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/filelists")
+    / f"{datetime.now(ZoneInfo(DEFAULT_TZ)).strftime('%Y-%m-%d')}_audio_file_list.csv"
 )
 COL_CREATION = "extracted_creation_time"
 COL_DURATION_SEC = "duration (seconds)"
 COL_DURATION_HMS = "duration_hms"
 COL_IS_DUPLICATE = "is_duplicate"
+COL_SIZE_MB = "size_mb"
 AUDIO_EXTENSIONS = (".m4a", ".caf")
+DUP_DIR_NAME = "_DUP"
 
 # Windows FILETIME: 100-ns intervals since 1601-01-01; Unix epoch offset.
 _EPOCH_AS_FILETIME = 116444736000000000
@@ -269,61 +276,261 @@ def build_file_list_from_audio_dir(
     return len(rows)
 
 
+def _cell_str(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _parse_float_or_neg_inf(value: object) -> float:
+    raw = _cell_str(value)
+    if not raw:
+        return float("-inf")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _duplicate_key_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Key for duplicate grouping: creation_time|duration|size_mb.
+
+    Empty string when any field is missing (those rows never join a group).
+    """
+    ct = (
+        df[COL_CREATION].map(_cell_str)
+        if COL_CREATION in df.columns
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    dur = (
+        df[COL_DURATION_SEC].map(_cell_str)
+        if COL_DURATION_SEC in df.columns
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    size_mb = (
+        df[COL_SIZE_MB].map(_cell_str)
+        if COL_SIZE_MB in df.columns
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    valid = ct.ne("") & dur.ne("") & size_mb.ne("")
+    key = ct + "|" + dur + "|" + size_mb
+    return key.where(valid, "")
+
+
+def _keeper_sort_key(row: pd.Series) -> Tuple[int, float, float, int, int, str]:
+    """
+    Prefer has extracted_creation_time, then longest duration, then size_mb,
+    then fewer 'recovered_' prefixes / shorter name (stable).
+    """
+    has_ct = 1 if _cell_str(row.get(COL_CREATION)) else 0
+    duration = _parse_float_or_neg_inf(row.get(COL_DURATION_SEC))
+    size_mb = _parse_float_or_neg_inf(row.get(COL_SIZE_MB))
+    name = _cell_str(row.get("name"))
+    recovered_depth = name.lower().count("recovered_")
+    return (has_ct, duration, size_mb, -recovered_depth, -len(name), name)
+
+
+def choose_keeper_index(group: pd.DataFrame) -> object:
+    """Return the index label of the preferred keeper row in group."""
+    best_idx = group.index[0]
+    best_key = _keeper_sort_key(group.loc[best_idx])
+    for idx in group.index[1:]:
+        key = _keeper_sort_key(group.loc[idx])
+        if key > best_key:
+            best_key = key
+            best_idx = idx
+        ## END if key > best_key....
+    ## END for idx in group.index[1:]....
+
+    return best_idx
+
+
 def mark_creation_time_duplicates(df: pd.DataFrame) -> Tuple[int, int]:
     """
-    Set is_duplicate from extracted_creation_time; return (dup_groups, dup_rows).
+    Set is_duplicate from matching (creation_time, duration, size_mb).
 
-    Empty / missing creation times are never treated as duplicates.
-    Every row in a group with count >= 2 is marked True.
+    Rows are duplicates IFF they share the same non-empty triple. Within each
+    group of size >= 2, the keeper (has creation_time, longest duration) is
+    False; all other members are True. Returns (dup_groups, dup_rows).
     """
-    ct = df[COL_CREATION].fillna("").astype(str).str.strip()
-    counts = ct.map(ct.value_counts())
-    is_dup = ct.ne("") & counts.ge(2)
+    key = _duplicate_key_series(df)
+    is_dup = pd.Series(False, index=df.index)
+    dup_groups = 0
+
+    for group_key, group in df.groupby(key, sort=False):
+        if not group_key or len(group) < 2:
+            continue
+        ## END if singleton or empty key....
+
+        dup_groups += 1
+        keeper_idx = choose_keeper_index(group)
+        for idx in group.index:
+            if idx != keeper_idx:
+                is_dup.loc[idx] = True
+            ## END if idx != keeper_idx....
+        ## END for idx in group.index....
+    ## END for group_key, group in df.groupby(key, sort=False)....
+
     df[COL_IS_DUPLICATE] = is_dup
-    dup_groups = int(ct[is_dup].nunique())
     dup_rows = int(is_dup.sum())
     return dup_groups, dup_rows
 
 
 def print_creation_time_duplicates(df: pd.DataFrame) -> None:
-    """Print every group that shares a non-empty extracted_creation_time."""
-    ct = df[COL_CREATION].fillna("").astype(str).str.strip()
-    non_empty = ct[ct != ""]
-    if non_empty.empty:
+    """Print every group that shares creation_time + duration + size_mb."""
+    key = _duplicate_key_series(df)
+    counts = key[key != ""].value_counts()
+    dup_keys = sorted(k for k, n in counts.items() if n >= 2)
+    if not dup_keys:
         print("No creation-time duplicate groups.")
         return
-    ## END if non_empty.empty....
+    ## END if not dup_keys....
 
-    counts = non_empty.value_counts()
-    dup_times = sorted(t for t, n in counts.items() if n >= 2)
-    if not dup_times:
-        print("No creation-time duplicate groups.")
-        return
-    ## END if not dup_times....
-
-    print(f"Creation-time duplicate groups: {len(dup_times)}")
+    print(f"Creation-time duplicate groups: {len(dup_keys)}")
     print()
-    for creation_time in dup_times:
-        group = df[ct == creation_time]
-        print(f"* {creation_time}  (x{len(group)})")
-        for _, row in group.iterrows():
-            name = row.get("name", "?")
-            parts = [f"    {name}"]
+    for group_key in dup_keys:
+        group = df[key == group_key]
+        creation_time, duration, size_mb = group_key.split("|", 2)
+        print(
+            f"* {creation_time}  dur={duration}  size_mb={size_mb}  "
+            f"(x{len(group)})"
+        )
+        keeper_idx = choose_keeper_index(group)
+        # Keeper first, then others by name.
+        ordered = pd.concat(
+            [
+                group.loc[[keeper_idx]],
+                group.drop(index=keeper_idx).sort_values(
+                    by="name", key=lambda s: s.map(_cell_str)
+                ),
+            ]
+        )
+        for idx, row in ordered.iterrows():
+            label = "KEEP  " if idx == keeper_idx else "DUP   "
+            name = _cell_str(row.get("name")) or "?"
+            parts = [f"    {label}{name}"]
+            ct_raw = row.get(COL_CREATION)
+            if _cell_str(ct_raw):
+                parts.append(f"extracted_creation_time={_cell_str(ct_raw)}")
+            ## END if creation_time present....
+
             size_raw = row.get("size_bytes")
-            if pd.notna(size_raw) and str(size_raw).strip() != "":
-                parts.append(f"size={size_raw}")
+            if _cell_str(size_raw):
+                parts.append(f"size_bytes={_cell_str(size_raw)}")
             ## END if size_bytes present....
 
             dur_raw = row.get(COL_DURATION_SEC)
-            if pd.notna(dur_raw) and str(dur_raw).strip() != "":
-                parts.append(f"dur={dur_raw}")
+            if _cell_str(dur_raw):
+                parts.append(f"dur={_cell_str(dur_raw)}")
             ## END if duration present....
 
             print("  ".join(parts))
-        ## END for _, row in group.iterrows()....
+        ## END for idx, row in ordered.iterrows()....
 
         print()
-    ## END for creation_time in dup_times....
+    ## END for group_key in dup_keys....
+
+
+def _unique_dest_path(dest_dir: Path, filename: str) -> Path:
+    """Return dest_dir/filename, or dest_dir/stem_N.suffix if that name exists."""
+    candidate = dest_dir / filename
+    if not candidate.exists():
+        return candidate
+    ## END if not candidate.exists....
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    n = 2
+    while True:
+        candidate = dest_dir / f"{stem}_{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        ## END if not candidate.exists....
+
+        n += 1
+    ## END while True....
+
+
+def move_duplicates_to_dup_dir(
+    df: pd.DataFrame,
+    audio_dir: Path,
+) -> Tuple[int, int, int]:
+    """
+    Move is_duplicate rows into audio_dir/_DUP/.
+
+    Updates full_path (and name if renamed for collision) on moved rows.
+    Returns (moved, skipped, fail).
+    """
+    if COL_IS_DUPLICATE not in df.columns:
+        return 0, 0, 0
+    ## END if COL_IS_DUPLICATE not in df.columns....
+
+    dup_dir = audio_dir / DUP_DIR_NAME
+    dup_dir_resolved = dup_dir.resolve()
+    moved = 0
+    skipped = 0
+    fail = 0
+
+    dup_mask = df[COL_IS_DUPLICATE].fillna(False).astype(bool)
+    if not dup_mask.any():
+        print(f"No duplicates to move -> {dup_dir}")
+        return 0, 0, 0
+    ## END if not dup_mask.any()....
+
+    dup_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Moving duplicates -> {dup_dir}")
+
+    for idx in df.index[dup_mask]:
+        row = df.loc[idx]
+        source = resolve_audio_path(row, audio_dir)
+        if source is None:
+            name = row.get("name", "?")
+            print(f"  ! Skip missing duplicate name={name!r}")
+            skipped += 1
+            continue
+        ## END if source is None....
+
+        try:
+            source_resolved = source.resolve()
+        except OSError as exc:
+            print(f"  ! Resolve failed for {source}: {exc}")
+            fail += 1
+            continue
+        ## END try resolve....
+
+        if source_resolved.parent == dup_dir_resolved or dup_dir_resolved in source_resolved.parents:
+            print(f"  ~ Already in {DUP_DIR_NAME}/: {source.name}")
+            skipped += 1
+            continue
+        ## END if already under _DUP....
+
+        dest = _unique_dest_path(dup_dir, source.name)
+        try:
+            source.rename(dest)
+        except OSError as exc:
+            print(f"  ! Move failed {source.name} -> {dest.name}: {exc}")
+            fail += 1
+            continue
+        ## END try rename....
+
+        df.at[idx, "full_path"] = str(dest)
+        if "name" in df.columns:
+            df.at[idx, "name"] = dest.name
+        ## END if name column....
+
+        moved += 1
+        if dest.name != source.name:
+            print(f"  moved {source.name} -> {DUP_DIR_NAME}/{dest.name}")
+        else:
+            print(f"  moved {source.name} -> {DUP_DIR_NAME}/")
+        ## END if dest.name != source.name....
+    ## END for idx in df.index[dup_mask]....
+
+    print(f"moved={moved} skipped={skipped} fail={fail} -> {dup_dir}")
+    return moved, skipped, fail
 
 
 def extract_for_csv(
@@ -331,13 +538,14 @@ def extract_for_csv(
     output_path: Path,
     audio_dir: Path,
     tz_name: str,
-) -> Tuple[int, int, int, int, int, int, int, int, int]:
+    move_duplicates: bool = False,
+) -> Tuple[int, int, int, int, int, int, int, int, int, int, int, int]:
     """
     Probe each row, set Windows creation time when present, write CSV columns.
 
     Returns
     (probed, creation_ok, duration_ok, missing_file, ffprobe_fail,
-     fs_set_ok, fs_set_fail, dup_groups, dup_rows).
+     fs_set_ok, fs_set_fail, dup_groups, dup_rows, moved, skipped, fail).
     """
     df = pd.read_csv(csv_path)
     creations: list[str] = []
@@ -400,9 +608,17 @@ def extract_for_csv(
     df[COL_DURATION_SEC] = durations_sec
     df[COL_DURATION_HMS] = durations_hms
     dup_groups, dup_rows = mark_creation_time_duplicates(df)
+    print_creation_time_duplicates(df)
+
+    moved = 0
+    skipped = 0
+    fail = 0
+    if move_duplicates:
+        moved, skipped, fail = move_duplicates_to_dup_dir(df, audio_dir)
+    ## END if move_duplicates....
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8")
-    print_creation_time_duplicates(df)
     return (
         probed,
         creation_ok,
@@ -413,6 +629,9 @@ def extract_for_csv(
         fs_set_fail,
         dup_groups,
         dup_rows,
+        moved,
+        skipped,
+        fail,
     )
 
 
@@ -425,8 +644,11 @@ def main() -> None:
             f"{COL_IS_DUPLICATE}). "
             "If the input CSV is missing, builds it from --audio-dir "
             f"({', '.join('*' + e for e in AUDIO_EXTENSIONS)}). "
-            "Flags rows that share a non-empty extracted_creation_time as "
-            "duplicates (annotation only). "
+            "Flags non-keeper rows that share the same non-empty "
+            f"{COL_CREATION} + {COL_DURATION_SEC!r} + {COL_SIZE_MB} as "
+            "duplicates (keeper prefers creation_time present and longest "
+            "duration). Pass --move-duplicates to move non-keepers into "
+            f"--audio-dir/{DUP_DIR_NAME}/. "
             "On Windows, also sets each file's Explorer Date created "
             "(Creation Time) column."
         )
@@ -462,6 +684,14 @@ def main() -> None:
         default=DEFAULT_TZ,
         help=f"Target timezone for extracted_creation_time (default: {DEFAULT_TZ})",
     )
+    parser.add_argument(
+        "--move-duplicates",
+        action="store_true",
+        help=(
+            f"Move rows marked is_duplicate into --audio-dir/{DUP_DIR_NAME}/ "
+            "(created as needed); keepers stay in place"
+        ),
+    )
     args = parser.parse_args()
 
     csv_path: Path = args.csv_path
@@ -485,6 +715,7 @@ def main() -> None:
     print(f"Input:  {csv_path}")
     print(f"Output: {output_path}")
     print(f"TZ:     {args.tz}")
+    print(f"Move duplicates: {args.move_duplicates}")
 
     (
         probed,
@@ -496,18 +727,23 @@ def main() -> None:
         fs_set_fail,
         dup_groups,
         dup_rows,
+        moved,
+        skipped,
+        fail,
     ) = extract_for_csv(
         csv_path=csv_path,
         output_path=output_path,
         audio_dir=args.audio_dir,
         tz_name=args.tz,
+        move_duplicates=args.move_duplicates,
     )
 
     print(
         f"Done. probed={probed} creation_ok={creation_ok} duration_ok={duration_ok} "
         f"missing_file={missing_file} ffprobe_fail={ffprobe_fail} "
         f"fs_set_ok={fs_set_ok} fs_set_fail={fs_set_fail} "
-        f"dup_groups={dup_groups} dup_rows={dup_rows} -> {output_path}"
+        f"dup_groups={dup_groups} dup_rows={dup_rows} "
+        f"moved={moved} skipped={skipped} fail={fail} -> {output_path}"
     )
 
 
