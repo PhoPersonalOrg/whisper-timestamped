@@ -282,6 +282,7 @@ def transcribe_crisper(
         word_timestamps=True,
         hallucination_mitigation=True,
         longform_strategy="continuation",
+        verbose=verbose,
     )
     if model.runtime == "ct2":
         kw["speculative_decoding"] = True

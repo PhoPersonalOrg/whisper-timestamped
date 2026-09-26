@@ -19,6 +19,10 @@ from whisper_timestamped.crisperwhisper.longform.early_eot import (
     engine_supports_recovery,
     recover_early_eot,
 )
+from whisper_timestamped.crisperwhisper.longform.progress import (
+    audio_progress_bar,
+    covered_frame_pos,
+)
 from whisper_timestamped.crisperwhisper.prompt import strip_prompt_artifacts
 from whisper_timestamped.crisperwhisper.result import ChunkResult, WordTimestamp
 from whisper_timestamped.crisperwhisper.word_timing import monotonize_words
@@ -84,6 +88,7 @@ def continuation_transcribe(
     hallucination_mitigation: bool = True,
     alignment_heads: list[tuple[int, int]] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> tuple[str, list[ChunkResult]]:
     """Run continuation-context longform transcription.
 
@@ -104,6 +109,7 @@ def continuation_transcribe(
             hallucination_mitigation=hallucination_mitigation,
             alignment_heads=alignment_heads,
             suppress_tokens=suppress_tokens,
+            verbose=verbose,
         )
         return text, chunk_results
 
@@ -119,64 +125,74 @@ def continuation_transcribe(
     confirmed_words: list[str] = []
     chunk_results: list[ChunkResult] = []
 
-    for i, chunk in enumerate(chunks):
-        is_last = i == n_chunks - 1
-        start_sec = i * config.stride
-        end_sec = start_sec + len(chunk) / SAMPLE_RATE
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            is_last = i == n_chunks - 1
+            start_sec = i * config.stride
+            end_sec = start_sec + len(chunk) / SAMPLE_RATE
 
-        if i == 0:
-            context_text = None
-        else:
-            ctx_words = confirmed_words[-config.context_words:] if confirmed_words else []
-            context_text = " ".join(ctx_words) if ctx_words else None
+            if i == 0:
+                context_text = None
+            else:
+                ctx_words = confirmed_words[-config.context_words:] if confirmed_words else []
+                context_text = " ".join(ctx_words) if ctx_words else None
 
-        if mode == "verbatim":
-            prompt_tokens = prompt_builder.verbatim(hotwords=hotwords, context=context_text)
-        else:
-            prompt_tokens = prompt_builder.intended(hotwords=hotwords, context=context_text)
+            if mode == "verbatim":
+                prompt_tokens = prompt_builder.verbatim(hotwords=hotwords, context=context_text)
+            else:
+                prompt_tokens = prompt_builder.intended(hotwords=hotwords, context=context_text)
 
-        features = engine.extract_features(chunk)
+            features = engine.extract_features(chunk)
 
-        gen_ids = engine.generate_with_repair(
-            features, prompt_tokens,
-            max_length=config.max_new_tokens,
-            hallucination_mitigation=hallucination_mitigation,
-            suppress_tokens=suppress_tokens,
-        )
+            gen_ids = engine.generate_with_repair(
+                features, prompt_tokens,
+                max_length=config.max_new_tokens,
+                hallucination_mitigation=hallucination_mitigation,
+                suppress_tokens=suppress_tokens,
+            )
 
-        raw = engine.decode_tokens(gen_ids, skip_special=True)
-        raw = strip_prompt_artifacts(raw)
-        words = raw.split()
+            raw = engine.decode_tokens(gen_ids, skip_special=True)
+            raw = strip_prompt_artifacts(raw)
+            words = raw.split()
 
-        if not words:
-            logger.warning("Chunk %d/%d produced empty output.", i + 1, n_chunks)
-            chunk_results.append(ChunkResult(
-                chunk_idx=i, start_sec=round(start_sec, 2),
-                end_sec=round(end_sec, 2), text="",
-                context=context_text, is_last=is_last,
-            ))
-            continue
+            if not words:
+                logger.warning("Chunk %d/%d produced empty output.", i + 1, n_chunks)
+                chunk_results.append(ChunkResult(
+                    chunk_idx=i, start_sec=round(start_sec, 2),
+                    end_sec=round(end_sec, 2), text="",
+                    context=context_text, is_last=is_last,
+                ))
+            else:
+                if is_last:
+                    safe_words = words
+                else:
+                    safe_words = (
+                        words[:-config.drop_words]
+                        if len(words) > config.drop_words
+                        else words
+                    )
 
-        if is_last:
-            safe_words = words
-        else:
-            safe_words = words[:-config.drop_words] if len(words) > config.drop_words else words
+                confirmed_words.extend(safe_words)
 
-        confirmed_words.extend(safe_words)
+                chunk_results.append(ChunkResult(
+                    chunk_idx=i,
+                    start_sec=round(start_sec, 2),
+                    end_sec=round(end_sec, 2),
+                    text=" ".join(safe_words),
+                    context=context_text,
+                    is_last=is_last,
+                ))
 
-        chunk_results.append(ChunkResult(
-            chunk_idx=i,
-            start_sec=round(start_sec, 2),
-            end_sec=round(end_sec, 2),
-            text=" ".join(safe_words),
-            context=context_text,
-            is_last=is_last,
-        ))
+                logger.info(
+                    "Chunk %d/%d: %d words (%d confirmed)",
+                    i + 1, n_chunks, len(words), len(safe_words),
+                )
 
-        logger.info(
-            "Chunk %d/%d: %d words (%d confirmed)",
-            i + 1, n_chunks, len(words), len(safe_words),
-        )
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     return " ".join(confirmed_words), chunk_results
 
@@ -191,6 +207,7 @@ def continuation_transcribe_with_word_timestamps(
     hallucination_mitigation: bool = True,
     alignment_heads: list[tuple[int, int]] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> tuple[str, list[ChunkResult], list[WordTimestamp]]:
     """Continuation longform that also returns per-word timestamps in the
     coordinate system of the original audio.
@@ -231,141 +248,148 @@ def continuation_transcribe_with_word_timestamps(
     chunk_results: list[ChunkResult] = []
     global_word_timestamps: list[WordTimestamp] = []
 
-    for i, chunk in enumerate(chunks):
-        is_last = i == n_chunks - 1
-        start_sec = i * config.stride
-        chunk_dur = len(chunk) / SAMPLE_RATE
-        end_sec = start_sec + chunk_dur
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            is_last = i == n_chunks - 1
+            start_sec = i * config.stride
+            chunk_dur = len(chunk) / SAMPLE_RATE
+            end_sec = start_sec + chunk_dur
 
-        if i == 0:
-            context_text = None
-        else:
-            ctx_words = confirmed_words[-config.context_words:] if confirmed_words else []
-            context_text = " ".join(ctx_words) if ctx_words else None
+            if i == 0:
+                context_text = None
+            else:
+                ctx_words = confirmed_words[-config.context_words:] if confirmed_words else []
+                context_text = " ".join(ctx_words) if ctx_words else None
 
-        if mode == "verbatim":
-            prompt_tokens = prompt_builder.verbatim(hotwords=hotwords, context=context_text)
-            sibling_prompt = prompt_builder.intended(hotwords=hotwords, context=context_text)
-        else:
-            prompt_tokens = prompt_builder.intended(hotwords=hotwords, context=context_text)
-            sibling_prompt = prompt_builder.verbatim(hotwords=hotwords, context=context_text)
+            if mode == "verbatim":
+                prompt_tokens = prompt_builder.verbatim(hotwords=hotwords, context=context_text)
+                sibling_prompt = prompt_builder.intended(hotwords=hotwords, context=context_text)
+            else:
+                prompt_tokens = prompt_builder.intended(hotwords=hotwords, context=context_text)
+                sibling_prompt = prompt_builder.verbatim(hotwords=hotwords, context=context_text)
 
-        features, mel = engine.extract_features_with_mel(chunk)
+            features, mel = engine.extract_features_with_mel(chunk)
 
-        # Speculative engines capture draft/main attention via their own
-        # Option B path (with built-in hallucination repair); plain
-        # engines use generate_with_repair_and_attention.  Both return a
-        # token list + a 1-to-1 ``[T, F_enc]`` attention matrix.
-        if hasattr(engine, "generate_with_attention"):
-            gen_ids, attention = engine.generate_with_attention(
-                features, prompt_tokens,
-                max_length=config.max_new_tokens,
-                hallucination_mitigation=hallucination_mitigation,
-                suppress_tokens=suppress_tokens,
-            )
-        else:
-            gen_ids, attention = engine.generate_with_repair_and_attention(
-                features, prompt_tokens,
-                max_length=config.max_new_tokens,
-                hallucination_mitigation=hallucination_mitigation,
-                suppress_tokens=suppress_tokens,
-            )
-
-        # Recover collapsed chunks via escalating-temperature re-decode.  Single
-        # mode: mel pre-filter, confirmed against the sibling-mode decode.
-        gen_ids, attention = decode_with_coverage_fallback(
-            engine, features, mel, prompt_tokens, gen_ids, attention,
-            max_length=config.max_new_tokens, want_attention=True,
-            enabled=config.temperature_fallback,
-            ref_prompt_tokens=sibling_prompt,
-            suppress_tokens=suppress_tokens,
-        )
-
-        # Extract chunk-local word timings, kept 1-to-1 with the word
-        # segmentation (unplaceable words appear as ``start=None`` placeholders).
-        # The timing pipeline's word segmentation is the single canonical word
-        # source, so text and timings stay perfectly aligned for the drop.
-        word_ts_local = extract_word_timings(
-            engine, gen_ids, attention, mel,
-            audio_duration_s=chunk_dur,
-            keep_unplaceable=True,
-            language=prompt_builder.language,
-        )
-
-        # Recover a context-conditioned early EOT (large_pro truncates at a
-        # sentence-final pause when context is present).  Only fires on a
-        # low-confidence stop that left speech-active audio uncovered, and only
-        # keeps the extension if it terminates confidently (see
-        # :func:`recover_early_eot`).  Re-capture attention/timings on recovery.
-        if config.early_eot.enabled and engine_supports_recovery(engine):
-            recovered = recover_early_eot(
-                engine, features, mel, prompt_tokens, gen_ids,
-                word_ts=word_ts_local, is_last=is_last,
-                max_length=config.max_new_tokens, suppress_tokens=suppress_tokens,
-                config=config.early_eot,
-            )
-            if len(recovered) != len(gen_ids):
-                gen_ids = recovered
-                attention = engine.cross_attention_for_tokens(
-                    features, prompt_tokens, gen_ids,
+            # Speculative engines capture draft/main attention via their own
+            # Option B path (with built-in hallucination repair); plain
+            # engines use generate_with_repair_and_attention.  Both return a
+            # token list + a 1-to-1 ``[T, F_enc]`` attention matrix.
+            if hasattr(engine, "generate_with_attention"):
+                gen_ids, attention = engine.generate_with_attention(
+                    features, prompt_tokens,
+                    max_length=config.max_new_tokens,
+                    hallucination_mitigation=hallucination_mitigation,
+                    suppress_tokens=suppress_tokens,
                 )
-                word_ts_local = extract_word_timings(
-                    engine, gen_ids, attention, mel,
-                    audio_duration_s=chunk_dur,
-                    keep_unplaceable=True,
-                    language=prompt_builder.language,
+            else:
+                gen_ids, attention = engine.generate_with_repair_and_attention(
+                    features, prompt_tokens,
+                    max_length=config.max_new_tokens,
+                    hallucination_mitigation=hallucination_mitigation,
+                    suppress_tokens=suppress_tokens,
                 )
 
-        words = [wt.word for wt in word_ts_local]
+            # Recover collapsed chunks via escalating-temperature re-decode.  Single
+            # mode: mel pre-filter, confirmed against the sibling-mode decode.
+            gen_ids, attention = decode_with_coverage_fallback(
+                engine, features, mel, prompt_tokens, gen_ids, attention,
+                max_length=config.max_new_tokens, want_attention=True,
+                enabled=config.temperature_fallback,
+                ref_prompt_tokens=sibling_prompt,
+                suppress_tokens=suppress_tokens,
+            )
 
-        if not words:
-            logger.warning("Chunk %d/%d produced empty output.", i + 1, n_chunks)
-            chunk_results.append(ChunkResult(
-                chunk_idx=i, start_sec=round(start_sec, 2),
-                end_sec=round(end_sec, 2), text="",
-                context=context_text, is_last=is_last,
-            ))
-            continue
+            # Extract chunk-local word timings, kept 1-to-1 with the word
+            # segmentation (unplaceable words appear as ``start=None`` placeholders).
+            # The timing pipeline's word segmentation is the single canonical word
+            # source, so text and timings stay perfectly aligned for the drop.
+            word_ts_local = extract_word_timings(
+                engine, gen_ids, attention, mel,
+                audio_duration_s=chunk_dur,
+                keep_unplaceable=True,
+                language=prompt_builder.language,
+            )
 
-        # Overlap-aware boundary: drop trailing words only when the next window
-        # re-covers them (see :func:`_overlap_drop_index`).
-        keep = _overlap_drop_index(
-            word_ts_local,
-            stride_sec=config.stride,
-            drop_words=config.drop_words,
-            timestamp_aware_drop=config.timestamp_aware_drop,
-            is_last=is_last,
-        )
-        safe_words = words[:keep]
-        safe_word_ts = word_ts_local[:keep]
+            # Recover a context-conditioned early EOT (large_pro truncates at a
+            # sentence-final pause when context is present).  Only fires on a
+            # low-confidence stop that left speech-active audio uncovered, and only
+            # keeps the extension if it terminates confidently (see
+            # :func:`recover_early_eot`).  Re-capture attention/timings on recovery.
+            if config.early_eot.enabled and engine_supports_recovery(engine):
+                recovered = recover_early_eot(
+                    engine, features, mel, prompt_tokens, gen_ids,
+                    word_ts=word_ts_local, is_last=is_last,
+                    max_length=config.max_new_tokens, suppress_tokens=suppress_tokens,
+                    config=config.early_eot,
+                )
+                if len(recovered) != len(gen_ids):
+                    gen_ids = recovered
+                    attention = engine.cross_attention_for_tokens(
+                        features, prompt_tokens, gen_ids,
+                    )
+                    word_ts_local = extract_word_timings(
+                        engine, gen_ids, attention, mel,
+                        audio_duration_s=chunk_dur,
+                        keep_unplaceable=True,
+                        language=prompt_builder.language,
+                    )
 
-        confirmed_words.extend(safe_words)
+            words = [wt.word for wt in word_ts_local]
 
-        # Lift chunk-local timings into global audio time (skip placeholders
-        # for words the Viterbi could not place -- they have no timestamp).
-        for wt in safe_word_ts:
-            if wt.start is None or wt.end is None:
-                continue
-            global_word_timestamps.append(WordTimestamp(
-                word=wt.word,
-                start=round(float(wt.start) + start_sec, 3),
-                end=round(float(wt.end) + start_sec, 3),
-            ))
+            if not words:
+                logger.warning("Chunk %d/%d produced empty output.", i + 1, n_chunks)
+                chunk_results.append(ChunkResult(
+                    chunk_idx=i, start_sec=round(start_sec, 2),
+                    end_sec=round(end_sec, 2), text="",
+                    context=context_text, is_last=is_last,
+                ))
+            else:
+                # Overlap-aware boundary: drop trailing words only when the next window
+                # re-covers them (see :func:`_overlap_drop_index`).
+                keep = _overlap_drop_index(
+                    word_ts_local,
+                    stride_sec=config.stride,
+                    drop_words=config.drop_words,
+                    timestamp_aware_drop=config.timestamp_aware_drop,
+                    is_last=is_last,
+                )
+                safe_words = words[:keep]
+                safe_word_ts = word_ts_local[:keep]
 
-        chunk_results.append(ChunkResult(
-            chunk_idx=i,
-            start_sec=round(start_sec, 2),
-            end_sec=round(end_sec, 2),
-            text=" ".join(safe_words),
-            context=context_text,
-            is_last=is_last,
-        ))
+                confirmed_words.extend(safe_words)
 
-        logger.info(
-            "Chunk %d/%d: %d words (%d confirmed, %d timed)",
-            i + 1, n_chunks, len(words), len(safe_words),
-            sum(1 for wt in safe_word_ts if wt.start is not None),
-        )
+                # Lift chunk-local timings into global audio time (skip placeholders
+                # for words the Viterbi could not place -- they have no timestamp).
+                for wt in safe_word_ts:
+                    if wt.start is None or wt.end is None:
+                        continue
+                    global_word_timestamps.append(WordTimestamp(
+                        word=wt.word,
+                        start=round(float(wt.start) + start_sec, 3),
+                        end=round(float(wt.end) + start_sec, 3),
+                    ))
+                ## END for wt in safe_word_ts
+
+                chunk_results.append(ChunkResult(
+                    chunk_idx=i,
+                    start_sec=round(start_sec, 2),
+                    end_sec=round(end_sec, 2),
+                    text=" ".join(safe_words),
+                    context=context_text,
+                    is_last=is_last,
+                ))
+
+                logger.info(
+                    "Chunk %d/%d: %d words (%d confirmed, %d timed)",
+                    i + 1, n_chunks, len(words), len(safe_words),
+                    sum(1 for wt in safe_word_ts if wt.start is not None),
+                )
+
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     # Monotonize at chunk seams: each word's start can't precede the
     # previous word's end.  Keeps the timeline strictly forward-going
@@ -430,6 +454,7 @@ def continuation_transcribe_dual(
     word_timestamps: bool = False,
     alignment_heads: list[tuple[int, int]] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> list[tuple[str, list[ChunkResult], list[WordTimestamp]]]:
     """Continuation longform for several modes at once (one shared decode).
 
@@ -465,155 +490,166 @@ def continuation_transcribe_dual(
     chunk_results: list[list[ChunkResult]] = [[] for _ in modes]
     global_ts: list[list[WordTimestamp]] = [[] for _ in modes]
 
-    for i, chunk in enumerate(chunks):
-        is_last = i == n_chunks - 1
-        start_sec = i * config.stride
-        chunk_dur = len(chunk) / SAMPLE_RATE
-        end_sec = start_sec + chunk_dur
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            is_last = i == n_chunks - 1
+            start_sec = i * config.stride
+            chunk_dur = len(chunk) / SAMPLE_RATE
+            end_sec = start_sec + chunk_dur
 
-        prompts: list[list[int]] = []
-        contexts: list[str | None] = []
-        for j, mode in enumerate(modes):
-            if i == 0:
-                ctx = None
-            else:
-                ctx_words = (
-                    confirmed[j][-config.context_words:] if confirmed[j] else []
-                )
-                ctx = " ".join(ctx_words) if ctx_words else None
-            contexts.append(ctx)
-            if mode == "verbatim":
-                prompts.append(
-                    prompt_builder.verbatim(hotwords=hotwords, context=ctx)
-                )
-            else:
-                prompts.append(
-                    prompt_builder.intended(hotwords=hotwords, context=ctx)
-                )
+            prompts: list[list[int]] = []
+            contexts: list[str | None] = []
+            for j, mode in enumerate(modes):
+                if i == 0:
+                    ctx = None
+                else:
+                    ctx_words = (
+                        confirmed[j][-config.context_words:] if confirmed[j] else []
+                    )
+                    ctx = " ".join(ctx_words) if ctx_words else None
+                contexts.append(ctx)
+                if mode == "verbatim":
+                    prompts.append(
+                        prompt_builder.verbatim(hotwords=hotwords, context=ctx)
+                    )
+                else:
+                    prompts.append(
+                        prompt_builder.intended(hotwords=hotwords, context=ctx)
+                    )
+            ## END for j, mode in enumerate(modes)
 
-        features1, mel = engine.extract_features_with_mel(chunk)
-        decoded = _decode_chunk_multi(
-            engine, features1, mel, prompts,
-            max_length=config.max_new_tokens,
-            hallucination_mitigation=hallucination_mitigation,
-            word_timestamps=capture_attn,
-            suppress_tokens=suppress_tokens,
-        )
-
-        # Both modes are already decoded -- gate each row on the discrepancy
-        # against its best sibling row right away (no mel, no extra decode).
-        base_counts = [word_count(engine, decoded[j][0]) for j in range(n_modes)]
-
-        for j, mode in enumerate(modes):
-            gen_ids, attention = decoded[j]
-
-            ref_n = max(
-                (base_counts[k] for k in range(n_modes) if k != j), default=0,
-            )
-            gen_ids, attention = decode_with_coverage_fallback(
-                engine, features1, mel, prompts[j], gen_ids, attention,
-                max_length=config.max_new_tokens, want_attention=capture_attn,
-                enabled=config.temperature_fallback,
-                ref_word_count=ref_n,
+            features1, mel = engine.extract_features_with_mel(chunk)
+            decoded = _decode_chunk_multi(
+                engine, features1, mel, prompts,
+                max_length=config.max_new_tokens,
+                hallucination_mitigation=hallucination_mitigation,
+                word_timestamps=capture_attn,
                 suppress_tokens=suppress_tokens,
             )
 
-            # When attention was captured, the timing pipeline's word
-            # segmentation is the canonical (1-to-1) word source; otherwise
-            # fall back to the plain decoded text.
-            word_ts_local: list[WordTimestamp] = []
-            if capture_attn:
-                word_ts_local = extract_word_timings(
-                    engine, gen_ids, attention, mel,
-                    audio_duration_s=chunk_dur,
-                    keep_unplaceable=True,
-                    language=prompt_builder.language,
+            # Both modes are already decoded -- gate each row on the discrepancy
+            # against its best sibling row right away (no mel, no extra decode).
+            base_counts = [word_count(engine, decoded[j][0]) for j in range(n_modes)]
+
+            for j, mode in enumerate(modes):
+                gen_ids, attention = decoded[j]
+
+                ref_n = max(
+                    (base_counts[k] for k in range(n_modes) if k != j), default=0,
                 )
-                # Recover a context-conditioned early EOT for this row (mirrors
-                # the single-mode path).  The recovery re-decode is single-prompt,
-                # so only a triggered row gives up batching -- and just for its
-                # own recovery; healthy rows are dismissed by the cheap gap check.
-                if config.early_eot.enabled and engine_supports_recovery(engine):
-                    recovered = recover_early_eot(
-                        engine, features1, mel, prompts[j], gen_ids,
-                        word_ts=word_ts_local, is_last=is_last,
-                        max_length=config.max_new_tokens,
-                        suppress_tokens=suppress_tokens, config=config.early_eot,
+                gen_ids, attention = decode_with_coverage_fallback(
+                    engine, features1, mel, prompts[j], gen_ids, attention,
+                    max_length=config.max_new_tokens, want_attention=capture_attn,
+                    enabled=config.temperature_fallback,
+                    ref_word_count=ref_n,
+                    suppress_tokens=suppress_tokens,
+                )
+
+                # When attention was captured, the timing pipeline's word
+                # segmentation is the canonical (1-to-1) word source; otherwise
+                # fall back to the plain decoded text.
+                word_ts_local: list[WordTimestamp] = []
+                if capture_attn:
+                    word_ts_local = extract_word_timings(
+                        engine, gen_ids, attention, mel,
+                        audio_duration_s=chunk_dur,
+                        keep_unplaceable=True,
+                        language=prompt_builder.language,
                     )
-                    if len(recovered) != len(gen_ids):
-                        gen_ids = recovered
-                        attention = engine.cross_attention_for_tokens(
-                            features1, prompts[j], gen_ids,
+                    # Recover a context-conditioned early EOT for this row (mirrors
+                    # the single-mode path).  The recovery re-decode is single-prompt,
+                    # so only a triggered row gives up batching -- and just for its
+                    # own recovery; healthy rows are dismissed by the cheap gap check.
+                    if config.early_eot.enabled and engine_supports_recovery(engine):
+                        recovered = recover_early_eot(
+                            engine, features1, mel, prompts[j], gen_ids,
+                            word_ts=word_ts_local, is_last=is_last,
+                            max_length=config.max_new_tokens,
+                            suppress_tokens=suppress_tokens, config=config.early_eot,
                         )
-                        word_ts_local = extract_word_timings(
-                            engine, gen_ids, attention, mel,
-                            audio_duration_s=chunk_dur,
-                            keep_unplaceable=True,
-                            language=prompt_builder.language,
-                        )
-                words = [wt.word for wt in word_ts_local]
-            else:
-                raw = strip_prompt_artifacts(
-                    engine.decode_tokens(gen_ids, skip_special=True)
-                )
-                words = raw.split()
+                        if len(recovered) != len(gen_ids):
+                            gen_ids = recovered
+                            attention = engine.cross_attention_for_tokens(
+                                features1, prompts[j], gen_ids,
+                            )
+                            word_ts_local = extract_word_timings(
+                                engine, gen_ids, attention, mel,
+                                audio_duration_s=chunk_dur,
+                                keep_unplaceable=True,
+                                language=prompt_builder.language,
+                            )
+                    words = [wt.word for wt in word_ts_local]
+                else:
+                    raw = strip_prompt_artifacts(
+                        engine.decode_tokens(gen_ids, skip_special=True)
+                    )
+                    words = raw.split()
 
-            if not words:
-                logger.warning(
-                    "Chunk %d/%d (%s) produced empty output.",
-                    i + 1, n_chunks, mode,
-                )
-                chunk_results[j].append(ChunkResult(
-                    chunk_idx=i, start_sec=round(start_sec, 2),
-                    end_sec=round(end_sec, 2), text="",
-                    context=contexts[j], is_last=is_last,
-                ))
-                continue
-
-            # Overlap-aware boundary per mode (independent -- fixed stride means
-            # no shared-seek coupling between modes).
-            if capture_attn:
-                keep = _overlap_drop_index(
-                    word_ts_local,
-                    stride_sec=config.stride,
-                    drop_words=config.drop_words,
-                    timestamp_aware_drop=config.timestamp_aware_drop,
-                    is_last=is_last,
-                )
-            else:
-                keep = (
-                    len(words) if is_last
-                    else max(len(words) - config.drop_words, 0)
-                )
-            safe_words = words[:keep]
-            safe_word_ts = word_ts_local[:keep]
-
-            confirmed[j].extend(safe_words)
-
-            # Surface timestamps only when the caller asked for them; skip
-            # placeholders for words the Viterbi could not place.
-            if word_timestamps:
-                for wt in safe_word_ts:
-                    if wt.start is None or wt.end is None:
-                        continue
-                    global_ts[j].append(WordTimestamp(
-                        word=wt.word,
-                        start=round(float(wt.start) + start_sec, 3),
-                        end=round(float(wt.end) + start_sec, 3),
+                if not words:
+                    logger.warning(
+                        "Chunk %d/%d (%s) produced empty output.",
+                        i + 1, n_chunks, mode,
+                    )
+                    chunk_results[j].append(ChunkResult(
+                        chunk_idx=i, start_sec=round(start_sec, 2),
+                        end_sec=round(end_sec, 2), text="",
+                        context=contexts[j], is_last=is_last,
                     ))
+                    continue
 
-            chunk_results[j].append(ChunkResult(
-                chunk_idx=i,
-                start_sec=round(start_sec, 2),
-                end_sec=round(end_sec, 2),
-                text=" ".join(safe_words),
-                context=contexts[j],
-                is_last=is_last,
-            ))
+                # Overlap-aware boundary per mode (independent -- fixed stride means
+                # no shared-seek coupling between modes).
+                if capture_attn:
+                    keep = _overlap_drop_index(
+                        word_ts_local,
+                        stride_sec=config.stride,
+                        drop_words=config.drop_words,
+                        timestamp_aware_drop=config.timestamp_aware_drop,
+                        is_last=is_last,
+                    )
+                else:
+                    keep = (
+                        len(words) if is_last
+                        else max(len(words) - config.drop_words, 0)
+                    )
+                safe_words = words[:keep]
+                safe_word_ts = word_ts_local[:keep]
+
+                confirmed[j].extend(safe_words)
+
+                # Surface timestamps only when the caller asked for them; skip
+                # placeholders for words the Viterbi could not place.
+                if word_timestamps:
+                    for wt in safe_word_ts:
+                        if wt.start is None or wt.end is None:
+                            continue
+                        global_ts[j].append(WordTimestamp(
+                            word=wt.word,
+                            start=round(float(wt.start) + start_sec, 3),
+                            end=round(float(wt.end) + start_sec, 3),
+                        ))
+                    ## END for wt in safe_word_ts
+
+                chunk_results[j].append(ChunkResult(
+                    chunk_idx=i,
+                    start_sec=round(start_sec, 2),
+                    end_sec=round(end_sec, 2),
+                    text=" ".join(safe_words),
+                    context=contexts[j],
+                    is_last=is_last,
+                ))
+            ## END for j, mode in enumerate(modes)
+
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     out: list[tuple[str, list[ChunkResult], list[WordTimestamp]]] = []
     for j in range(n_modes):
         if word_timestamps:
             monotonize_words(global_ts[j])
         out.append((" ".join(confirmed[j]), chunk_results[j], global_ts[j]))
+    ## END for j in range(n_modes)
     return out

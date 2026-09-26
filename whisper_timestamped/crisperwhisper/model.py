@@ -538,6 +538,7 @@ class CrisperWhisperModel:
         word_timestamps: bool = False,
         alignment_heads: list[tuple[int, int]] | None = None,
         suppress_tokens: list[int] | None = None,
+        verbose: bool = False,
     ) -> TranscriptionResult:
         """Transcribe audio.
 
@@ -628,6 +629,10 @@ class CrisperWhisperModel:
             list overrides it for this call, and ``[]`` disables suppression
             entirely.  Applied identically on both backends and on every
             decode path (greedy, repair, speculative, temperature fallback).
+        verbose
+            When ``False`` (default), show an openai-whisper-style frames
+            progress bar during longform chunk loops.  When ``True``, disable
+            the bar (callers that print transcript text use this).
 
         Returns
         -------
@@ -670,6 +675,7 @@ class CrisperWhisperModel:
             word_timestamps=word_timestamps,
             alignment_heads=alignment_heads,
             suppress_tokens=suppress_tokens,
+            verbose=verbose,
         )
 
     def transcribe_dual(
@@ -836,6 +842,7 @@ class CrisperWhisperModel:
                 word_timestamps=word_timestamps,
                 alignment_heads=alignment_heads,
                 suppress_tokens=suppress_tokens,
+                verbose=False,
             )
 
         elapsed = time.perf_counter() - t0
@@ -1007,6 +1014,7 @@ class CrisperWhisperModel:
         word_timestamps: bool = False,
         alignment_heads: list[tuple[int, int]] | None = None,
         suppress_tokens: list[int] | None = None,
+        verbose: bool = False,
     ) -> TranscriptionResult:
         """Full v2 transcription pipeline (CT2 or transformers backend)."""
         lf_config = self._validated_longform_config(
@@ -1115,6 +1123,7 @@ class CrisperWhisperModel:
                     mode=mode, hotwords=hw,
                     alignment_heads=alignment_heads,
                     suppress_tokens=suppress_tokens,
+                    verbose=verbose,
                 )
             elif longform_strategy == "continuation":
                 if word_timestamps:
@@ -1124,6 +1133,7 @@ class CrisperWhisperModel:
                         hallucination_mitigation=hallucination_mitigation,
                         alignment_heads=alignment_heads,
                         suppress_tokens=suppress_tokens,
+                        verbose=verbose,
                     )
                 else:
                     # continuation_transcribe needs alignment_heads too: with
@@ -1136,12 +1146,14 @@ class CrisperWhisperModel:
                         hallucination_mitigation=hallucination_mitigation,
                         alignment_heads=alignment_heads,
                         suppress_tokens=suppress_tokens,
+                        verbose=verbose,
                     )
             else:
                 text, chunks = strategy_fn(
                     engine, prompt_builder, audio_array, lf_config,
                     mode=mode, hotwords=hw,
                     suppress_tokens=suppress_tokens,
+                    verbose=verbose,
                 )
 
         elapsed = time.perf_counter() - t0

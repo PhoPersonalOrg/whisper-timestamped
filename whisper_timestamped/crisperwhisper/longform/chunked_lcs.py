@@ -13,6 +13,10 @@ from typing import TYPE_CHECKING, Callable, TypeVar
 import numpy as np
 
 from whisper_timestamped.crisperwhisper.longform.base import LongformConfig, make_chunks
+from whisper_timestamped.crisperwhisper.longform.progress import (
+    audio_progress_bar,
+    covered_frame_pos,
+)
 from whisper_timestamped.crisperwhisper.prompt import strip_prompt_artifacts
 from whisper_timestamped.crisperwhisper.result import ChunkResult, WordTimestamp
 from whisper_timestamped.crisperwhisper.word_timing import monotonize_words
@@ -101,6 +105,7 @@ def chunked_lcs_transcribe(
     mode: str = "verbatim",
     hotwords: list[str] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> tuple[str, list[ChunkResult]]:
     """Run chunked word-level LCS longform transcription.
 
@@ -123,31 +128,38 @@ def chunked_lcs_transcribe(
     raw_texts: list[list[str]] = []
     chunk_results: list[ChunkResult] = []
 
-    for i, chunk in enumerate(chunks):
-        start_sec = i * config.stride
-        end_sec = start_sec + len(chunk) / SAMPLE_RATE
-        features = engine.extract_features(chunk)
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            start_sec = i * config.stride
+            end_sec = start_sec + len(chunk) / SAMPLE_RATE
+            features = engine.extract_features(chunk)
 
-        gen_ids = engine.generate(
-            features, [prompt_tokens],
-            max_length=config.max_new_tokens,
-            suppress_tokens=suppress_tokens,
-        )[0]
+            gen_ids = engine.generate(
+                features, [prompt_tokens],
+                max_length=config.max_new_tokens,
+                suppress_tokens=suppress_tokens,
+            )[0]
 
-        raw = engine.decode_tokens(gen_ids, skip_special=True)
-        raw = strip_prompt_artifacts(raw)
-        words = raw.split()
-        raw_texts.append(words)
+            raw = engine.decode_tokens(gen_ids, skip_special=True)
+            raw = strip_prompt_artifacts(raw)
+            words = raw.split()
+            raw_texts.append(words)
 
-        chunk_results.append(ChunkResult(
-            chunk_idx=i,
-            start_sec=round(start_sec, 2),
-            end_sec=round(end_sec, 2),
-            text=raw,
-            is_last=(i == n_chunks - 1),
-        ))
+            chunk_results.append(ChunkResult(
+                chunk_idx=i,
+                start_sec=round(start_sec, 2),
+                end_sec=round(end_sec, 2),
+                text=raw,
+                is_last=(i == n_chunks - 1),
+            ))
 
-        logger.info("Chunk %d/%d: %d words", i + 1, n_chunks, len(words))
+            logger.info("Chunk %d/%d: %d words", i + 1, n_chunks, len(words))
+
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     # Stitch via LCS
     result_words = list(raw_texts[0])
@@ -157,6 +169,7 @@ def chunked_lcs_transcribe(
         )
         chunk_results[i].stitch_lcs_length = length
         chunk_results[i].stitch_lcs_words = lcs_words
+    ## END for i in range(1, n_chunks)
 
     return " ".join(result_words), chunk_results
 
@@ -170,6 +183,7 @@ def chunked_lcs_transcribe_with_word_timestamps(
     hotwords: list[str] | None = None,
     alignment_heads: list[tuple[int, int]] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> tuple[str, list[ChunkResult], list[WordTimestamp]]:
     """Chunked LCS longform that also returns per-word timestamps in the
     coordinate system of the original audio.
@@ -209,53 +223,60 @@ def chunked_lcs_transcribe_with_word_timestamps(
     per_chunk_ts: list[list[WordTimestamp]] = []
     chunk_results: list[ChunkResult] = []
 
-    for i, chunk in enumerate(chunks):
-        start_sec = i * config.stride
-        chunk_dur = len(chunk) / SAMPLE_RATE
-        end_sec = start_sec + chunk_dur
-        features, mel = engine.extract_features_with_mel(chunk)
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            start_sec = i * config.stride
+            chunk_dur = len(chunk) / SAMPLE_RATE
+            end_sec = start_sec + chunk_dur
+            features, mel = engine.extract_features_with_mel(chunk)
 
-        gen_ids = engine.generate(
-            features, [prompt_tokens],
-            max_length=config.max_new_tokens,
-            suppress_tokens=suppress_tokens,
-        )[0]
+            gen_ids = engine.generate(
+                features, [prompt_tokens],
+                max_length=config.max_new_tokens,
+                suppress_tokens=suppress_tokens,
+            )[0]
 
-        attention = engine.cross_attention_for_tokens(
-            features, prompt_tokens, gen_ids,
-        )
-        word_ts_local = extract_word_timings(
-            engine, gen_ids, attention, mel,
-            audio_duration_s=chunk_dur,
-            keep_unplaceable=True,
-            language=prompt_builder.language,
-        )
-
-        # Lift chunk-local timings into global audio time; unplaceable words
-        # keep their position (and word text) with ``None`` timings.
-        lifted = [
-            WordTimestamp(
-                word=wt.word,
-                start=None if wt.start is None else round(float(wt.start) + start_sec, 3),
-                end=None if wt.end is None else round(float(wt.end) + start_sec, 3),
+            attention = engine.cross_attention_for_tokens(
+                features, prompt_tokens, gen_ids,
             )
-            for wt in word_ts_local
-        ]
-        per_chunk_ts.append(lifted)
+            word_ts_local = extract_word_timings(
+                engine, gen_ids, attention, mel,
+                audio_duration_s=chunk_dur,
+                keep_unplaceable=True,
+                language=prompt_builder.language,
+            )
 
-        chunk_results.append(ChunkResult(
-            chunk_idx=i,
-            start_sec=round(start_sec, 2),
-            end_sec=round(end_sec, 2),
-            text=" ".join(wt.word for wt in lifted),
-            is_last=(i == n_chunks - 1),
-        ))
+            # Lift chunk-local timings into global audio time; unplaceable words
+            # keep their position (and word text) with ``None`` timings.
+            lifted = [
+                WordTimestamp(
+                    word=wt.word,
+                    start=None if wt.start is None else round(float(wt.start) + start_sec, 3),
+                    end=None if wt.end is None else round(float(wt.end) + start_sec, 3),
+                )
+                for wt in word_ts_local
+            ]
+            per_chunk_ts.append(lifted)
 
-        logger.info(
-            "Chunk %d/%d: %d words (%d timed)",
-            i + 1, n_chunks, len(lifted),
-            sum(1 for wt in lifted if wt.start is not None),
-        )
+            chunk_results.append(ChunkResult(
+                chunk_idx=i,
+                start_sec=round(start_sec, 2),
+                end_sec=round(end_sec, 2),
+                text=" ".join(wt.word for wt in lifted),
+                is_last=(i == n_chunks - 1),
+            ))
+
+            logger.info(
+                "Chunk %d/%d: %d words (%d timed)",
+                i + 1, n_chunks, len(lifted),
+                sum(1 for wt in lifted if wt.start is not None),
+            )
+
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     # Stitch via LCS -- identical stitch decision to the untimed path (the
     # LCS compares word strings), but carrying each word's timestamp through.
@@ -266,6 +287,7 @@ def chunked_lcs_transcribe_with_word_timestamps(
         )
         chunk_results[i].stitch_lcs_length = length
         chunk_results[i].stitch_lcs_words = lcs_words
+    ## END for i in range(1, n_chunks)
 
     text = " ".join(wt.word for wt in result)
     words = [wt for wt in result if wt.start is not None and wt.end is not None]

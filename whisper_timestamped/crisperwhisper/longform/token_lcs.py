@@ -13,6 +13,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from whisper_timestamped.crisperwhisper.longform.base import LongformConfig, make_chunks
+from whisper_timestamped.crisperwhisper.longform.progress import (
+    audio_progress_bar,
+    covered_frame_pos,
+)
 from whisper_timestamped.crisperwhisper.prompt import strip_prompt_artifacts
 from whisper_timestamped.crisperwhisper.result import ChunkResult, WordTimestamp
 from whisper_timestamped.crisperwhisper.word_timing import (
@@ -87,6 +91,7 @@ def token_lcs_transcribe(
     mode: str = "verbatim",
     hotwords: list[str] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> tuple[str, list[ChunkResult]]:
     """Run token-level LCS longform transcription.
 
@@ -108,30 +113,37 @@ def token_lcs_transcribe(
     token_seqs: list[list[int]] = []
     chunk_results: list[ChunkResult] = []
 
-    for i, chunk in enumerate(chunks):
-        start_sec = i * config.stride
-        end_sec = start_sec + len(chunk) / SAMPLE_RATE
-        features = engine.extract_features(chunk)
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            start_sec = i * config.stride
+            end_sec = start_sec + len(chunk) / SAMPLE_RATE
+            features = engine.extract_features(chunk)
 
-        gen_ids = engine.generate(
-            features, [prompt_tokens],
-            max_length=config.max_new_tokens,
-            suppress_tokens=suppress_tokens,
-        )[0]
+            gen_ids = engine.generate(
+                features, [prompt_tokens],
+                max_length=config.max_new_tokens,
+                suppress_tokens=suppress_tokens,
+            )[0]
 
-        token_seqs.append(gen_ids)
-        raw = engine.decode_tokens(gen_ids, skip_special=True)
-        raw = strip_prompt_artifacts(raw)
+            token_seqs.append(gen_ids)
+            raw = engine.decode_tokens(gen_ids, skip_special=True)
+            raw = strip_prompt_artifacts(raw)
 
-        chunk_results.append(ChunkResult(
-            chunk_idx=i,
-            start_sec=round(start_sec, 2),
-            end_sec=round(end_sec, 2),
-            text=raw,
-            is_last=(i == n_chunks - 1),
-        ))
+            chunk_results.append(ChunkResult(
+                chunk_idx=i,
+                start_sec=round(start_sec, 2),
+                end_sec=round(end_sec, 2),
+                text=raw,
+                is_last=(i == n_chunks - 1),
+            ))
 
-        logger.info("Chunk %d/%d: %d tokens", i + 1, n_chunks, len(gen_ids))
+            logger.info("Chunk %d/%d: %d tokens", i + 1, n_chunks, len(gen_ids))
+
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     merged = _find_longest_common_token_sequence(token_seqs, engine.all_special_ids)
     text = engine.decode_tokens(merged, skip_special=True)
@@ -149,6 +161,7 @@ def token_lcs_transcribe_with_word_timestamps(
     hotwords: list[str] | None = None,
     alignment_heads: list[tuple[int, int]] | None = None,
     suppress_tokens: list[int] | None = None,
+    verbose: bool = False,
 ) -> tuple[str, list[ChunkResult], list[WordTimestamp]]:
     """Token-level LCS longform that also returns per-word timestamps in the
     coordinate system of the original audio.
@@ -192,59 +205,68 @@ def token_lcs_transcribe_with_word_timestamps(
     tok2word: list[dict[int, int]] = []  # per chunk: orig token idx -> word idx
     chunk_results: list[ChunkResult] = []
 
-    for i, chunk in enumerate(chunks):
-        start_sec = i * config.stride
-        chunk_dur = len(chunk) / SAMPLE_RATE
-        end_sec = start_sec + chunk_dur
-        features, mel = engine.extract_features_with_mel(chunk)
+    previous = 0
+    with audio_progress_bar(audio, verbose=verbose) as pbar:
+        for i, chunk in enumerate(chunks):
+            start_sec = i * config.stride
+            chunk_dur = len(chunk) / SAMPLE_RATE
+            end_sec = start_sec + chunk_dur
+            features, mel = engine.extract_features_with_mel(chunk)
 
-        gen_ids = engine.generate(
-            features, [prompt_tokens],
-            max_length=config.max_new_tokens,
-            suppress_tokens=suppress_tokens,
-        )[0]
-        token_seqs.append(gen_ids)
+            gen_ids = engine.generate(
+                features, [prompt_tokens],
+                max_length=config.max_new_tokens,
+                suppress_tokens=suppress_tokens,
+            )[0]
+            token_seqs.append(gen_ids)
 
-        attention = engine.cross_attention_for_tokens(
-            features, prompt_tokens, gen_ids,
-        )
-        word_ts_local = extract_word_timings(
-            engine, gen_ids, attention, mel,
-            audio_duration_s=chunk_dur,
-            keep_unplaceable=True,
-            language=prompt_builder.language,
-        )
-        chunk_word_ts.append(word_ts_local)
+            attention = engine.cross_attention_for_tokens(
+                features, prompt_tokens, gen_ids,
+            )
+            word_ts_local = extract_word_timings(
+                engine, gen_ids, attention, mel,
+                audio_duration_s=chunk_dur,
+                keep_unplaceable=True,
+                language=prompt_builder.language,
+            )
+            chunk_word_ts.append(word_ts_local)
 
-        # Same segmentation extract_word_timings uses internally: maps each
-        # content token (by its position in ``gen_ids``) to its word index,
-        # so provenance tags can be resolved to per-chunk word timings.
-        tok_pieces = [engine.tokenizer.decode([t]) for t in gen_ids]
-        word_token_indices, _ = segment_tokens_into_words(
-            engine, gen_ids, tok_pieces, language=prompt_builder.language,
-        )
-        mapping: dict[int, int] = {}
-        for w_idx, tok_idxs in enumerate(word_token_indices):
-            for k in tok_idxs:
-                mapping[k] = w_idx
-        tok2word.append(mapping)
+            # Same segmentation extract_word_timings uses internally: maps each
+            # content token (by its position in ``gen_ids``) to its word index,
+            # so provenance tags can be resolved to per-chunk word timings.
+            tok_pieces = [engine.tokenizer.decode([t]) for t in gen_ids]
+            word_token_indices, _ = segment_tokens_into_words(
+                engine, gen_ids, tok_pieces, language=prompt_builder.language,
+            )
+            mapping: dict[int, int] = {}
+            for w_idx, tok_idxs in enumerate(word_token_indices):
+                for k in tok_idxs:
+                    mapping[k] = w_idx
+                ## END for k in tok_idxs
+            ## END for w_idx, tok_idxs in enumerate(word_token_indices)
+            tok2word.append(mapping)
 
-        raw = engine.decode_tokens(gen_ids, skip_special=True)
-        raw = strip_prompt_artifacts(raw)
+            raw = engine.decode_tokens(gen_ids, skip_special=True)
+            raw = strip_prompt_artifacts(raw)
 
-        chunk_results.append(ChunkResult(
-            chunk_idx=i,
-            start_sec=round(start_sec, 2),
-            end_sec=round(end_sec, 2),
-            text=raw,
-            is_last=(i == n_chunks - 1),
-        ))
+            chunk_results.append(ChunkResult(
+                chunk_idx=i,
+                start_sec=round(start_sec, 2),
+                end_sec=round(end_sec, 2),
+                text=raw,
+                is_last=(i == n_chunks - 1),
+            ))
 
-        logger.info(
-            "Chunk %d/%d: %d tokens (%d timed words)",
-            i + 1, n_chunks, len(gen_ids),
-            sum(1 for wt in word_ts_local if wt.start is not None),
-        )
+            logger.info(
+                "Chunk %d/%d: %d tokens (%d timed words)",
+                i + 1, n_chunks, len(gen_ids),
+                sum(1 for wt in word_ts_local if wt.start is not None),
+            )
+
+            seek = covered_frame_pos(audio, i, chunk, config.stride)
+            pbar.update(max(0, seek - previous))
+            previous = seek
+        ## END for i, chunk in enumerate(chunks)
 
     merged = _merge_with_provenance(token_seqs, engine.all_special_ids)
     merged_tokens = [t for t, _, _ in merged]
@@ -279,6 +301,7 @@ def token_lcs_transcribe_with_word_timestamps(
             continue
         # A seam word can mix two chunks' timings; never let end precede start.
         words.append(WordTimestamp(word=word_text, start=start, end=max(start, end)))
+    ## END for group, word_text in zip(merged_word_groups, merged_word_texts)
 
     monotonize_words(words)
 
