@@ -1,10 +1,11 @@
 import os
-# import sys
+import re
+import sys
 # import argparse
 import json
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 import torch
 from whisper.utils import str2bool, optional_float, optional_int
@@ -13,6 +14,38 @@ from whisper_timestamped.transcribe import write_csv, flatten, remove_keys, get_
 from whisper_timestamped.parse_video_filename import build_EDF_compatible_video_filename, parse_video_filename
 # from whisper_timestamped import remove_non_speech
 from whisper_timestamped.transcribe import remove_non_speech
+
+
+def _running_in_wsl() -> bool:
+    """True when running inside WSL (not native Windows or bare Linux)."""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/version", encoding="utf-8") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def host_path(path: Union[str, Path]) -> Path:
+    """Map Windows drive paths ↔ WSL ``/mnt/<drive>/...`` for the current host.
+
+    Convert before ``.resolve()``. Unrelated paths are returned unchanged.
+    """
+    s = str(path).replace("\\", "/")
+    drive_m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    if drive_m:
+        letter, rest = drive_m.group(1), drive_m.group(2)
+        if _running_in_wsl():
+            return Path(f"/mnt/{letter.lower()}/{rest}")
+        return Path(f"{letter}:/{rest}")
+
+    mnt_m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", s)
+    if mnt_m and sys.platform == "win32" and not _running_in_wsl():
+        letter, rest = mnt_m.group(1).upper(), mnt_m.group(2)
+        return Path(f"{letter}:/{rest}")
+
+    return Path(path)
 
 try:
     # Old whisper version # Before https://github.com/openai/whisper/commit/da600abd2b296a5450770b872c3765d0a5a5c769
@@ -195,16 +228,15 @@ def process_recordings(
     crisper_mode: str = "verbatim",
     crisper_runtime: str = "auto",
 ):
-    # Define the recordings directory
-    if isinstance(recordings_dir, str):
-        recordings_dir = Path(recordings_dir).resolve()
+    # Define the recordings directory (Windows drive ↔ /mnt/<drive> when in WSL)
+    recordings_dir = host_path(recordings_dir).resolve()
     print(f'processing_recordings for recordings_dir: "{recordings_dir.as_posix()}"...')
     # Create output directory
     if output_dir is None:
         output_dir = recordings_dir.joinpath('transcriptions').resolve()
         # output_dir = Path("./transcriptions")
-    if isinstance(output_dir, str):
-        output_dir = Path(output_dir).resolve()
+    else:
+        output_dir = host_path(output_dir).resolve()
 
     output_dir.mkdir(exist_ok=True)
     print(f'\t transcriptions will output to output_dir: "{output_dir.as_posix()}"')
@@ -227,7 +259,7 @@ def process_recordings(
     # Load the model once (after file discovery so progress is visible sooner)
     if model_name is None:
         model_name = "medium" if backend == "crisperwhisper" else "medium.en"
-    model_path_root = model_path_root.resolve()
+    model_path_root = host_path(model_path_root).resolve()
     # CrisperWhisper weights come from HuggingFace cache, not model_path_root.
     if backend != "crisperwhisper":
         assert model_path_root.exists()
@@ -330,11 +362,9 @@ if __name__ == "__main__":
 
 
     #TODO 2026-09-24 11:55: - [ ] audio recordings from WhisperApp audio exports
-    # recordings_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
-    # output_dir = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
-
-    recordings_dir = Path(r"/mnt/h/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
-    output_dir = Path(r"/mnt/h/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions").resolve()  # your target
+    # Windows-style paths; host_path() maps to /mnt/<drive>/... under WSL2.
+    recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio")
+    output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
 
     video_extensions = ['.m4a']
 
