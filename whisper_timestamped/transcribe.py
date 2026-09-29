@@ -1999,6 +1999,36 @@ def check_vad_method(method, with_version=False):
         return check_vad_method(method, with_version=with_version)
     return method
 
+
+def _is_usable_silero_hub_dir(path):
+    """True if ``path`` is a real torch.hub Silero checkout (has hubconf.py)."""
+    return os.path.isdir(path) and os.path.isfile(os.path.join(path, "hubconf.py"))
+
+
+def _sanitize_silero_hub_cache(repo_or_dir_master):
+    """Repair leftover v3 folder-hack state that breaks torch.hub on Windows.
+
+    A failed folder-hack cleanup can leave ``snakers4_silero-vad_master`` as a
+    broken symlink while the real checkout sits at ``*.tmp``.  ``os.path.exists``
+    then returns False, so we re-download and hit FileExistsError when renaming
+    onto the still-present symlink entry.
+    """
+    tmp = repo_or_dir_master + ".tmp"
+    master_lexists = os.path.lexists(repo_or_dir_master)
+    master_exists = os.path.exists(repo_or_dir_master)
+    is_link = master_lexists and os.path.islink(repo_or_dir_master)
+    tmp_is_real_dir = os.path.isdir(tmp) and not os.path.islink(tmp)
+
+    if tmp_is_real_dir and (is_link or not master_exists):
+        if master_lexists:
+            os.unlink(repo_or_dir_master)
+        shutil.move(tmp, repo_or_dir_master)
+        return
+
+    if is_link and not master_exists:
+        os.unlink(repo_or_dir_master)
+
+
 _silero_vad_model = {}
 _has_onnx = None
 def get_vad_segments(audio,
@@ -2059,11 +2089,17 @@ def get_vad_segments(audio,
             repo_or_dir_master = os.path.expanduser(torch_home + "/hub/snakers4_silero-vad_master")
             repo_or_dir_specific = os.path.expanduser(torch_home + f"/hub/snakers4_silero-vad_{version}") if version else repo_or_dir_master
             repo_or_dir = repo_or_dir_specific
+            _sanitize_silero_hub_cache(repo_or_dir_master)
             tmp_folder = None
             def apply_folder_hack():
                 nonlocal tmp_folder
-                if os.path.exists(repo_or_dir_master):
+                if os.path.lexists(repo_or_dir_master):
                     tmp_folder = repo_or_dir_master + ".tmp"
+                    if os.path.lexists(tmp_folder):
+                        if os.path.islink(tmp_folder) or os.path.isfile(tmp_folder):
+                            os.unlink(tmp_folder)
+                        else:
+                            shutil.rmtree(tmp_folder)
                     shutil.move(repo_or_dir_master, tmp_folder)
                 # Make a symlink to the v3.1 model, otherwise it fails
                 input_exists = os.path.exists(repo_or_dir_specific)
@@ -2075,7 +2111,7 @@ def get_vad_segments(audio,
                     shutil.rmtree(repo_or_dir_specific)
 
             source = "local"
-            if not os.path.exists(repo_or_dir):
+            if not _is_usable_silero_hub_dir(repo_or_dir):
                 # Load specific version of silero
                 repo_or_dir = f"snakers4/silero-vad:{version}" if version else "snakers4/silero-vad"
                 source = "github"
@@ -2090,9 +2126,9 @@ def get_vad_segments(audio,
                 raise RuntimeError(f"Problem when installing silero with version {version}. Check versions here: https://github.com/snakers4/silero-vad/wiki/Version-history-and-Available-Models") from err
             finally:
                 if need_folder_hack:
-                    if os.path.exists(repo_or_dir_master):
-                        os.remove(repo_or_dir_master)
-                    if tmp_folder:
+                    if os.path.lexists(repo_or_dir_master) and os.path.islink(repo_or_dir_master):
+                        os.unlink(repo_or_dir_master)
+                    if tmp_folder and os.path.isdir(tmp_folder) and not os.path.lexists(repo_or_dir_master):
                         shutil.move(tmp_folder, repo_or_dir_master)
             assert os.path.isdir(repo_or_dir_specific), f"Unexpected situation: missing {repo_or_dir_specific}"
 

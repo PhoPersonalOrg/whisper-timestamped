@@ -666,7 +666,10 @@ def process_recordings(
 if __name__ == "__main__":
     # Switch formats here instead of commenting path blocks.
     # Known ids: debut | rec_continuous | ios_whisper_app | just_press_record | voice_memos
-    ACTIVE_FORMAT = "just_press_record"
+    # ACTIVE_FORMAT = "just_press_record" #TODO 2026-09-29 11:11: - [ ] WORKING WIN
+    # ACTIVE_FORMAT = "ios_whisper_app" #TODO 2026-09-29 11:12: - [ ] WORKING WIN
+    ACTIVE_FORMAT = "voice_memos" 
+
     fmt = get_format(ACTIVE_FORMAT)
     process_recordings_kwargs = fmt.process_recordings_kwargs()
     print(
