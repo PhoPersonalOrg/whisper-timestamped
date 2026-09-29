@@ -366,8 +366,13 @@ if __name__ == "__main__":
     # recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
     # output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
 
-    recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
-    output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
+    
+    # ==================================================================================================================================================================================================================================================================================== #
+    # `Just Press Record` iOS App Transcription                                                                                                                                                                                                                                            #
+    # ==================================================================================================================================================================================================================================================================================== #
+    # "H:/backups/2026-09-21_iPhone15Pro/Just Press Record/2023-08-10/16-12-39.m4a" -> parse to name "2023-08-10_16-12-39.m4a"
+    recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/Just Press Record")
+    output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/Just Press Record/transcriptions")
 
     video_extensions = ['.m4a']
 
