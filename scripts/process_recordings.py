@@ -14,6 +14,7 @@ from whisper.utils import str2bool, optional_float, optional_int
 import whisper_timestamped as whisper
 from whisper_timestamped.transcribe import write_csv, flatten, remove_keys, get_vad_segments
 from whisper_timestamped.parse_video_filename import build_EDF_compatible_video_filename, parse_video_filename
+from whisper_timestamped.recording_formats import get_format
 # from whisper_timestamped import remove_non_speech
 from whisper_timestamped.transcribe import remove_non_speech
 
@@ -663,29 +664,15 @@ def process_recordings(
 
 
 if __name__ == "__main__":
-    # Format(s) of the output file(s). Possible formats are: txt, vtt, srt, tsv, csv, json. Several formats can be specified by using commas (ex: "json,vtt,srt"). By default ("all"), all available formats  
-    # recordings_dir = Path(r"M:\ScreenRecordings\EyeTrackerVR_Recordings").resolve() # Debut_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%
-    # recordings_dir = Path(r"I:/ScreenRecordings/REC_continuous_video_recorder").resolve() # CAM_%YYYY%-%MM%-%DD%T%HH%%MIN%%SS%  # e.g. CAM_2026-01-09T081552.mp4
-    # output_dir = None
-    # # video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v']
-    # video_extensions = ['.mp4', '.mkv']
-
-
-    #TODO 2026-09-24 11:55: - [ ] audio recordings from WhisperApp audio exports
-    # Windows-style paths; host_path() maps to /mnt/<drive>/... under WSL2.
-    # recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
-    # output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
-    # video_extensions = None
-    # process_recordings_kwargs = dict(recordings_dir=recordings_dir, output_dir=output_dir, video_extensions=video_extensions)
-
-    # ==================================================================================================================================================================================================================================================================================== #
-    # `Just Press Record` iOS App Transcription                                                                                                                                                                                                                                            #
-    # ==================================================================================================================================================================================================================================================================================== #
-    # "H:/backups/2026-09-21_iPhone15Pro/Just Press Record/2023-08-10/16-12-39.m4a" -> parse to name "2023-08-10_16-12-39.m4a"
-    filelist_csv = host_path("H:/backups/2026-09-21_iPhone15Pro/Just Press Record/filelists/2026-09-29_jpr_audio_file_list.csv")
-    output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/Just Press Record/transcriptions")
-    process_recordings_kwargs = dict(filelist_csv=filelist_csv, output_dir=output_dir)
-
+    # Switch formats here instead of commenting path blocks.
+    # Known ids: debut | rec_continuous | ios_whisper_app | just_press_record | voice_memos
+    ACTIVE_FORMAT = "just_press_record"
+    fmt = get_format(ACTIVE_FORMAT)
+    process_recordings_kwargs = fmt.process_recordings_kwargs()
+    print(
+        f"Active recordings format: {fmt.id} ({fmt.label}) -> "
+        f"{process_recordings_kwargs}"
+    )
 
     try:
         output_files = process_recordings(

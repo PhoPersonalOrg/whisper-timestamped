@@ -1,5 +1,5 @@
 """
-Extract embedded m4a/caf creation_time (UTC -> local) into a file-list CSV.
+Extract creation_time / duration into a file-list CSV for audio exports.
 
 Adds/overwrites columns:
   - extracted_creation_time
@@ -11,14 +11,11 @@ Adds/overwrites columns:
 Also sets each media file's Windows "Date created" / Creation Time (the
 column sortable in Explorer) to the probed recording creation_time when present.
 
-If the input CSV is missing, builds it from --audio-dir (*.m4a, *.caf) and saves it
-before probing. Bootstrap scans flat files and one-level date folders
-(Just Press Record: YYYY-MM-DD/HH-MM-SS.ext); matching paths use a concatenated
-transcript name (YYYY-MM-DD_HH-MM-SS.ext) as CSV `name`.
-
-For Just Press Record path layouts, extracted_creation_time comes from the
-date folder + time stem (local wall clock), not ffprobe. Other layouts still
-use embedded format.tags.creation_time (UTC -> --tz).
+If the input CSV is missing, builds it from --audio-dir via the selected
+``RecordingsFormat`` (see ``--format`` / auto-detect). Format-specific
+layouts (Just Press Record date folders, Voice Memos ``YYYYMMDD HHMMSS``
+filenames, etc.) supply transcript ``name`` and wall-clock creation time;
+other layouts fall back to ffprobe ``format.tags.creation_time`` (UTC -> --tz).
 
 After probing, flags content duplicates that match on creation time, duration,
 and size_mb. Within each group, keeps the row with extracted_creation_time
@@ -31,6 +28,7 @@ Duration fields are optional: missing values leave empty cells (no failure).
 Example:
 ```bash
 ./.venv/Scripts/python.exe scripts/iOSWhisperAppHelpers/extract_m4a_creation_times.py
+./.venv/Scripts/python.exe scripts/iOSWhisperAppHelpers/extract_m4a_creation_times.py --format voice_memos
 ./.venv/Scripts/python.exe scripts/iOSWhisperAppHelpers/extract_m4a_creation_times.py --move-duplicates
 ```
 """
@@ -40,7 +38,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
-import os
 import subprocess
 import sys
 from ctypes import wintypes
@@ -51,11 +48,20 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-DEFAULT_AUDIO_DIR = Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
+from whisper_timestamped.recording_formats import (
+    DUP_DIR_NAME,
+    RecordingsFormat,
+    detect_format,
+    get_format,
+    list_format_ids,
+    parse_just_press_record_path,  # re-export for callers
+)
+
 DEFAULT_TZ = "America/Los_Angeles"
-DEFAULT_CSV_PATH = (
-    Path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/filelists")
-    / f"{datetime.now(ZoneInfo(DEFAULT_TZ)).strftime('%Y-%m-%d')}_audio_file_list.csv"
+_DEFAULT_FORMAT = get_format("ios_whisper_app")
+DEFAULT_AUDIO_DIR = _DEFAULT_FORMAT.default_recordings_dir
+DEFAULT_CSV_PATH = _DEFAULT_FORMAT.default_filelist_csv_path(
+    datetime.now(ZoneInfo(DEFAULT_TZ)).replace(tzinfo=None)
 )
 COL_CREATION = "extracted_creation_time"
 COL_DURATION_SEC = "duration (seconds)"
@@ -63,7 +69,6 @@ COL_DURATION_HMS = "duration_hms"
 COL_IS_DUPLICATE = "is_duplicate"
 COL_SIZE_MB = "size_mb"
 AUDIO_EXTENSIONS = (".m4a", ".caf")
-DUP_DIR_NAME = "_DUP"
 
 # Windows FILETIME: 100-ns intervals since 1601-01-01; Unix epoch offset.
 _EPOCH_AS_FILETIME = 116444736000000000
@@ -163,29 +168,6 @@ def local_str_to_utc(local_str: str, tz_name: str) -> datetime:
     return local.astimezone(ZoneInfo("UTC"))
 
 
-def parse_just_press_record_path(path: Path) -> Optional[Tuple[str, str]]:
-    """ "Just Press Record" helper
-    Parse "Just Press Record" export path: .../YYYY-MM-DD/HH-MM-SS.ext
-
-    Returns (transcript_name, extracted_creation_time) or None when the
-    parent folder / stem are not a valid date / time pair.
-
-    transcript_name: YYYY-MM-DD_HH-MM-SS.ext
-    extracted_creation_time: YYYY-MM-DD HH:MM:SS (path wall clock; no TZ convert)
-    """
-    parent = path.parent.name
-    stem = path.stem
-    try:
-        datetime.strptime(parent, "%Y-%m-%d")
-        time_part = datetime.strptime(stem, "%H-%M-%S")
-    except ValueError:
-        return None
-
-    transcript_name = f"{parent}_{stem}{path.suffix}"
-    creation = f"{parent} {time_part.strftime('%H:%M:%S')}"
-    return transcript_name, creation
-
-
 def format_duration_seconds(duration_sec: float) -> str:
     return f"{duration_sec:.3f}"
 
@@ -237,94 +219,35 @@ def set_windows_creation_time(path: Path, utc_dt: datetime) -> None:
         kernel32.CloseHandle(handle)
 
 
-def _fs_timestamp_to_local_str(epoch_sec: float, tz_name: str) -> str:
-    """Format a Unix epoch seconds value as local YYYY-MM-DD HH:MM:SS."""
-    utc_dt = datetime.fromtimestamp(epoch_sec, tz=ZoneInfo("UTC"))
-    return utc_to_local_str(utc_dt, tz_name)
-
-
-def _birth_time_epoch(stat_result: os.stat_result) -> float:
-    """Windows birth time is st_ctime; prefer st_birthtime elsewhere when present."""
-    if sys.platform == "win32":
-        return float(stat_result.st_ctime)
-    birth = getattr(stat_result, "st_birthtime", None)
-    if birth is not None:
-        return float(birth)
-    return float(stat_result.st_ctime)
-
-
 def build_file_list_from_audio_dir(
     audio_dir: Path,
     csv_path: Path,
     tz_name: str,
+    fmt: Optional[RecordingsFormat] = None,
 ) -> int:
     """
-    Scan audio_dir for *.m4a / *.caf (flat and one-level nested) and write CSV.
+    Scan audio_dir via *fmt* (or auto-detect / ios_whisper_app) and write CSV.
 
-    Just Press Record date/time paths use concatenated transcript names as
-    `name`. Columns: name, size_bytes, size_mb, creation_time,
-    modification_time, full_path. Returns the number of rows written.
+    Columns: name, size_bytes, size_mb, creation_time, modification_time,
+    full_path (+ format extras such as title). Returns the number of rows written.
     """
-    if not audio_dir.is_dir():
-        raise SystemExit(f"Audio directory not found: {audio_dir}")
+    if fmt is None:
+        fmt = detect_format(audio_dir) or get_format("ios_whisper_app")
+    ## END if fmt is None....
 
-    seen: set[Path] = set()
-    paths: list[Path] = []
-    for ext in AUDIO_EXTENSIONS:
-        for pattern in (f"*{ext}", f"*/*{ext}"):
-            for p in audio_dir.glob(pattern):
-                if not p.is_file():
-                    continue
-                if p.parent.name == DUP_DIR_NAME:
-                    continue
-                if p in seen:
-                    continue
-                seen.add(p)
-                paths.append(p)
-            ## END for p in audio_dir.glob(pattern)....
-        ## END for pattern in (flat, one-level)....
-    ## END for ext in AUDIO_EXTENSIONS....
-
-    paths = sorted(paths)
-    if not paths:
-        exts = ", ".join(AUDIO_EXTENSIONS)
-        raise SystemExit(f"No audio files ({exts}) found in: {audio_dir}")
-
-    rows: list[dict[str, object]] = []
-    for path in paths:
-        st = path.stat()
-        size_bytes = int(st.st_size)
-        jpr = parse_just_press_record_path(path)
-        name = jpr[0] if jpr is not None else path.name
-        rows.append(
-            {
-                "name": name,
-                "size_bytes": size_bytes,
-                "size_mb": f"{size_bytes / 1_048_576:.3f}",
-                "creation_time": _fs_timestamp_to_local_str(
-                    _birth_time_epoch(st), tz_name
-                ),
-                "modification_time": _fs_timestamp_to_local_str(st.st_mtime, tz_name),
-                "full_path": str(path),
-            }
+    try:
+        n = fmt.ensure_filelist_csv(
+            csv_path=csv_path,
+            recordings_dir=audio_dir,
+            tz_name=tz_name,
         )
-    ## END for path in paths....
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "name",
-            "size_bytes",
-            "size_mb",
-            "creation_time",
-            "modification_time",
-            "full_path",
-        ],
-    )
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(csv_path, index=False, encoding="utf-8")
-    print(f"Built file-list CSV ({len(rows)} rows) -> {csv_path}")
-    return len(rows)
+    print(f"Built file-list CSV ({n} rows) [{fmt.id}] -> {csv_path}")
+    return n
 
 
 def _cell_str(value: object) -> str:
@@ -590,6 +513,7 @@ def extract_for_csv(
     audio_dir: Path,
     tz_name: str,
     move_duplicates: bool = False,
+    fmt: Optional[RecordingsFormat] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, int, int, int, int]:
     """
     Probe each row, set Windows creation time when present, write CSV columns.
@@ -598,6 +522,10 @@ def extract_for_csv(
     (probed, creation_ok, duration_ok, missing_file, ffprobe_fail,
      fs_set_ok, fs_set_fail, dup_groups, dup_rows, moved, skipped, fail).
     """
+    if fmt is None:
+        fmt = detect_format(audio_dir) or get_format("ios_whisper_app")
+    ## END if fmt is None....
+
     df = pd.read_csv(csv_path)
     creations: list[str] = []
     durations_sec: list[str] = []
@@ -624,21 +552,20 @@ def extract_for_csv(
 
         probed += 1
         utc_dt, duration_sec = probe_format_metadata(path)
-        jpr = parse_just_press_record_path(path)
+        format_creation = fmt.extract_creation_time(path, tz_name=tz_name)
 
         if utc_dt is None and duration_sec is None:
             # Likely ffprobe failure or empty format; count once when both absent
             # after a successful path resolve (probe already logged on failure).
             ffprobe_fail += 1
 
-        if jpr is not None:
-            _transcript_name, creation_str = jpr
-            creations.append(creation_str)
+        if format_creation is not None:
+            creations.append(format_creation)
             creation_ok += 1
             if sys.platform == "win32":
                 try:
                     set_windows_creation_time(
-                        path, local_str_to_utc(creation_str, tz_name)
+                        path, local_str_to_utc(format_creation, tz_name)
                     )
                     fs_set_ok += 1
                 except OSError as exc:
@@ -658,7 +585,7 @@ def extract_for_csv(
             ## END if win32....
         else:
             creations.append("")
-        ## END if jpr / utc_dt....
+        ## END if format_creation / utc_dt....
 
         if duration_sec is not None:
             durations_sec.append(format_duration_seconds(duration_sec))
@@ -701,19 +628,27 @@ def extract_for_csv(
     )
 
 
+def _resolve_cli_format(
+    format_id: Optional[str],
+    audio_dir: Path,
+) -> RecordingsFormat:
+    if format_id:
+        return get_format(format_id)
+    detected = detect_format(audio_dir)
+    if detected is not None:
+        return detected
+    return get_format("ios_whisper_app")
+
+
 def main() -> None:
+    known = ", ".join(list_format_ids())
     parser = argparse.ArgumentParser(
         description=(
-            "Extract embedded m4a/caf creation_time (UTC -> local) and optional "
-            f"duration columns into a file-list CSV "
+            "Extract creation_time / duration columns into a file-list CSV "
             f"({COL_CREATION}, {COL_DURATION_SEC!r}, {COL_DURATION_HMS}, "
             f"{COL_IS_DUPLICATE}). "
-            "If the input CSV is missing, builds it from --audio-dir "
-            f"(flat and one-level nested "
-            f"{', '.join('*' + e for e in AUDIO_EXTENSIONS)}). "
-            "Just Press Record paths (YYYY-MM-DD/HH-MM-SS.ext) set "
-            f"{COL_CREATION} from the path and use concatenated transcript "
-            "names when bootstrapping. "
+            "If the input CSV is missing, builds it from --audio-dir using "
+            "the selected recordings format (--format or auto-detect). "
             "Flags non-keeper rows that share the same non-empty "
             f"{COL_CREATION} + {COL_DURATION_SEC!r} + {COL_SIZE_MB} as "
             "duplicates (keeper prefers creation_time present and longest "
@@ -727,9 +662,9 @@ def main() -> None:
         "csv_path",
         type=Path,
         nargs="?",
-        default=DEFAULT_CSV_PATH,
+        default=None,
         help=(
-            f"Input CSV (default: {DEFAULT_CSV_PATH}); "
+            "Input CSV (default: format's dated filelist path); "
             "created from --audio-dir if missing"
         ),
     )
@@ -743,11 +678,17 @@ def main() -> None:
     parser.add_argument(
         "--audio-dir",
         type=Path,
-        default=DEFAULT_AUDIO_DIR,
+        default=None,
         help=(
-            f"Audio directory for missing-CSV bootstrap and when full_path "
-            f"is missing (default: {DEFAULT_AUDIO_DIR})"
+            "Audio directory for missing-CSV bootstrap and when full_path "
+            "is missing (default: selected format's default_recordings_dir)"
         ),
+    )
+    parser.add_argument(
+        "--format",
+        dest="format_id",
+        default=None,
+        help=f"Recordings format id (known: {known}); default: auto-detect",
     )
     parser.add_argument(
         "--tz",
@@ -764,16 +705,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    csv_path: Path = args.csv_path
+    audio_dir_for_detect = args.audio_dir or DEFAULT_AUDIO_DIR
+    fmt = _resolve_cli_format(args.format_id, audio_dir_for_detect)
+    audio_dir: Path = args.audio_dir or fmt.default_recordings_dir
+    csv_path: Path = args.csv_path or fmt.default_filelist_csv_path(
+        datetime.now(ZoneInfo(args.tz)).replace(tzinfo=None)
+    )
     output_path: Path = args.output if args.output is not None else csv_path
 
     if not csv_path.is_file():
         print(f"CSV not found: {csv_path}")
-        print(f"Building from audio dir: {args.audio_dir}")
+        print(f"Building from audio dir: {audio_dir} (format={fmt.id})")
         build_file_list_from_audio_dir(
-            audio_dir=args.audio_dir,
+            audio_dir=audio_dir,
             csv_path=csv_path,
             tz_name=args.tz,
+            fmt=fmt,
         )
     ## END if not csv_path.is_file()....
 
@@ -782,6 +729,7 @@ def main() -> None:
             "Warning: not Windows; filesystem creation times will not be updated."
         )
 
+    print(f"Format: {fmt.id} ({fmt.label})")
     print(f"Input:  {csv_path}")
     print(f"Output: {output_path}")
     print(f"TZ:     {args.tz}")
@@ -803,9 +751,10 @@ def main() -> None:
     ) = extract_for_csv(
         csv_path=csv_path,
         output_path=output_path,
-        audio_dir=args.audio_dir,
+        audio_dir=audio_dir,
         tz_name=args.tz,
         move_duplicates=args.move_duplicates,
+        fmt=fmt,
     )
 
     print(
