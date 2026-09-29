@@ -363,6 +363,9 @@ if __name__ == "__main__":
 
     #TODO 2026-09-24 11:55: - [ ] audio recordings from WhisperApp audio exports
     # Windows-style paths; host_path() maps to /mnt/<drive>/... under WSL2.
+    # recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
+    # output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
+
     recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
     output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
 
