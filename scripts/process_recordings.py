@@ -124,10 +124,7 @@ def collect_extant_transcript_paths(output_dir: Path, base_name: str) -> Dict[st
     return cols
 
 
-def flatten_write_results_to_transcript_cols(
-    curr_output_files_dict: dict,
-    base_name: str,
-) -> Dict[str, str]:
+def flatten_write_results_to_transcript_col( curr_output_files_dict: dict, base_name: str) -> Dict[str, str]:
     """Map write_results nested dict to transcript_* absolute path strings."""
     cols: Dict[str, str] = {
         _transcript_column_for_key(key): "" for key, _ in _TRANSCRIPT_OUTPUT_SPECS
@@ -141,22 +138,6 @@ def flatten_write_results_to_transcript_cols(
     ## END for key, by_base in curr_output_files_dict.items()....
 
     return cols
-
-
-def _is_truthy_duplicate(value: object) -> bool:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return False
-    if pd.isna(value):
-        return False
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("true", "1", "yes")
-
-
-def _default_output_dir_for_filelist(filelist_csv: Path) -> Path:
-    if filelist_csv.parent.name.lower() == "filelists":
-        return filelist_csv.parent.parent / "transcriptions"
-    return filelist_csv.parent / "transcriptions"
 
 
 def find_extant_output_files(output_dir: Path, base_name: str, output_formats = ['json', 'csv', 'srt', 'vtt', 'txt']) -> List[Path]:
@@ -326,7 +307,14 @@ def process_recordings(
         print(f'processing_recordings for filelist_csv: "{filelist_path.as_posix()}"...')
 
         if output_dir is None:
-            output_dir = host_path(_default_output_dir_for_filelist(filelist_path)).resolve()
+            # filelists/foo.csv → sibling transcriptions/; else beside the CSV
+            if filelist_path.parent.name.lower() == "filelists":
+                output_dir = filelist_path.parent.parent / "transcriptions"
+            else:
+                output_dir = filelist_path.parent / "transcriptions"
+            ## END if under filelists/....
+
+            output_dir = host_path(output_dir).resolve()
         else:
             output_dir = host_path(output_dir).resolve()
         ## END if output_dir is None....
@@ -338,12 +326,17 @@ def process_recordings(
         alias_dir.mkdir(exist_ok=True)
 
         for idx, row in filelist_df.iterrows():
-            if "is_duplicate" in filelist_df.columns and _is_truthy_duplicate(
-                row.get("is_duplicate")
-            ):
-                print(f"  ~ Skipping duplicate row index={idx}")
-                continue
-            ## END if is_duplicate....
+            # Skip non-keepers flagged by extract_m4a_creation_times (bool or "true"/"1"/"yes")
+            if "is_duplicate" in filelist_df.columns:
+                dup_raw = row.get("is_duplicate")
+                if pd.notna(dup_raw) and (
+                    dup_raw is True
+                    or str(dup_raw).strip().lower() in ("true", "1", "yes")
+                ):
+                    print(f"  ~ Skipping duplicate row index={idx}")
+                    continue
+                ## END if truthy is_duplicate....
+            ## END if is_duplicate column....
 
             full_path_raw = row.get("full_path")
             if pd.isna(full_path_raw) or not str(full_path_raw).strip():
