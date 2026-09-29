@@ -124,7 +124,7 @@ def collect_extant_transcript_paths(output_dir: Path, base_name: str) -> Dict[st
     return cols
 
 
-def flatten_write_results_to_transcript_col( curr_output_files_dict: dict, base_name: str) -> Dict[str, str]:
+def flatten_write_results_to_transcript_cols( curr_output_files_dict: dict, base_name: str) -> Dict[str, str]:
     """Map write_results nested dict to transcript_* absolute path strings."""
     cols: Dict[str, str] = {
         _transcript_column_for_key(key): "" for key, _ in _TRANSCRIPT_OUTPUT_SPECS
