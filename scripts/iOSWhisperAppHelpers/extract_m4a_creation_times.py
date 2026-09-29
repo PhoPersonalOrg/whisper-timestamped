@@ -12,7 +12,13 @@ Also sets each media file's Windows "Date created" / Creation Time (the
 column sortable in Explorer) to the probed recording creation_time when present.
 
 If the input CSV is missing, builds it from --audio-dir (*.m4a, *.caf) and saves it
-before probing.
+before probing. Bootstrap scans flat files and one-level date folders
+(Just Press Record: YYYY-MM-DD/HH-MM-SS.ext); matching paths use a concatenated
+transcript name (YYYY-MM-DD_HH-MM-SS.ext) as CSV `name`.
+
+For Just Press Record path layouts, extracted_creation_time comes from the
+date folder + time stem (local wall clock), not ffprobe. Other layouts still
+use embedded format.tags.creation_time (UTC -> --tz).
 
 After probing, flags content duplicates that match on creation time, duration,
 and size_mb. Within each group, keeps the row with extracted_creation_time
@@ -150,6 +156,36 @@ def utc_to_local_str(utc_dt: datetime, tz_name: str) -> str:
     return local.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def local_str_to_utc(local_str: str, tz_name: str) -> datetime:
+    """Parse naive YYYY-MM-DD HH:MM:SS as tz_name local, return aware UTC."""
+    naive = datetime.strptime(local_str, "%Y-%m-%d %H:%M:%S")
+    local = naive.replace(tzinfo=ZoneInfo(tz_name))
+    return local.astimezone(ZoneInfo("UTC"))
+
+
+def parse_just_press_record_path(path: Path) -> Optional[Tuple[str, str]]:
+    """ "Just Press Record" helper
+    Parse "Just Press Record" export path: .../YYYY-MM-DD/HH-MM-SS.ext
+
+    Returns (transcript_name, extracted_creation_time) or None when the
+    parent folder / stem are not a valid date / time pair.
+
+    transcript_name: YYYY-MM-DD_HH-MM-SS.ext
+    extracted_creation_time: YYYY-MM-DD HH:MM:SS (path wall clock; no TZ convert)
+    """
+    parent = path.parent.name
+    stem = path.stem
+    try:
+        datetime.strptime(parent, "%Y-%m-%d")
+        time_part = datetime.strptime(stem, "%H-%M-%S")
+    except ValueError:
+        return None
+
+    transcript_name = f"{parent}_{stem}{path.suffix}"
+    creation = f"{parent} {time_part.strftime('%H:%M:%S')}"
+    return transcript_name, creation
+
+
 def format_duration_seconds(duration_sec: float) -> str:
     return f"{duration_sec:.3f}"
 
@@ -223,20 +259,33 @@ def build_file_list_from_audio_dir(
     tz_name: str,
 ) -> int:
     """
-    Scan audio_dir for *.m4a / *.caf and write a file-list CSV.
+    Scan audio_dir for *.m4a / *.caf (flat and one-level nested) and write CSV.
 
-    Columns: name, size_bytes, size_mb, creation_time, modification_time, full_path.
-    Returns the number of rows written.
+    Just Press Record date/time paths use concatenated transcript names as
+    `name`. Columns: name, size_bytes, size_mb, creation_time,
+    modification_time, full_path. Returns the number of rows written.
     """
     if not audio_dir.is_dir():
         raise SystemExit(f"Audio directory not found: {audio_dir}")
 
-    paths = sorted(
-        p
-        for ext in AUDIO_EXTENSIONS
-        for p in audio_dir.glob(f"*{ext}")
-        if p.is_file()
-    )
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    for ext in AUDIO_EXTENSIONS:
+        for pattern in (f"*{ext}", f"*/*{ext}"):
+            for p in audio_dir.glob(pattern):
+                if not p.is_file():
+                    continue
+                if p.parent.name == DUP_DIR_NAME:
+                    continue
+                if p in seen:
+                    continue
+                seen.add(p)
+                paths.append(p)
+            ## END for p in audio_dir.glob(pattern)....
+        ## END for pattern in (flat, one-level)....
+    ## END for ext in AUDIO_EXTENSIONS....
+
+    paths = sorted(paths)
     if not paths:
         exts = ", ".join(AUDIO_EXTENSIONS)
         raise SystemExit(f"No audio files ({exts}) found in: {audio_dir}")
@@ -245,9 +294,11 @@ def build_file_list_from_audio_dir(
     for path in paths:
         st = path.stat()
         size_bytes = int(st.st_size)
+        jpr = parse_just_press_record_path(path)
+        name = jpr[0] if jpr is not None else path.name
         rows.append(
             {
-                "name": path.name,
+                "name": name,
                 "size_bytes": size_bytes,
                 "size_mb": f"{size_bytes / 1_048_576:.3f}",
                 "creation_time": _fs_timestamp_to_local_str(
@@ -573,13 +624,28 @@ def extract_for_csv(
 
         probed += 1
         utc_dt, duration_sec = probe_format_metadata(path)
+        jpr = parse_just_press_record_path(path)
 
         if utc_dt is None and duration_sec is None:
             # Likely ffprobe failure or empty format; count once when both absent
             # after a successful path resolve (probe already logged on failure).
             ffprobe_fail += 1
 
-        if utc_dt is not None:
+        if jpr is not None:
+            _transcript_name, creation_str = jpr
+            creations.append(creation_str)
+            creation_ok += 1
+            if sys.platform == "win32":
+                try:
+                    set_windows_creation_time(
+                        path, local_str_to_utc(creation_str, tz_name)
+                    )
+                    fs_set_ok += 1
+                except OSError as exc:
+                    print(f"  ! SetFileTime failed for {path.name}: {exc}")
+                    fs_set_fail += 1
+            ## END if win32....
+        elif utc_dt is not None:
             creations.append(utc_to_local_str(utc_dt, tz_name))
             creation_ok += 1
             if sys.platform == "win32":
@@ -592,7 +658,7 @@ def extract_for_csv(
             ## END if win32....
         else:
             creations.append("")
-        ## END if utc_dt....
+        ## END if jpr / utc_dt....
 
         if duration_sec is not None:
             durations_sec.append(format_duration_seconds(duration_sec))
@@ -643,7 +709,11 @@ def main() -> None:
             f"({COL_CREATION}, {COL_DURATION_SEC!r}, {COL_DURATION_HMS}, "
             f"{COL_IS_DUPLICATE}). "
             "If the input CSV is missing, builds it from --audio-dir "
-            f"({', '.join('*' + e for e in AUDIO_EXTENSIONS)}). "
+            f"(flat and one-level nested "
+            f"{', '.join('*' + e for e in AUDIO_EXTENSIONS)}). "
+            "Just Press Record paths (YYYY-MM-DD/HH-MM-SS.ext) set "
+            f"{COL_CREATION} from the path and use concatenated transcript "
+            "names when bootstrapping. "
             "Flags non-keeper rows that share the same non-empty "
             f"{COL_CREATION} + {COL_DURATION_SEC!r} + {COL_SIZE_MB} as "
             "duplicates (keeper prefers creation_time present and longest "
