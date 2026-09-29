@@ -1,5 +1,6 @@
 import os
 import re
+import signal
 import sys
 # import argparse
 import json
@@ -101,6 +102,83 @@ _TRANSCRIPT_OUTPUT_SPECS: List[Tuple[str, str]] = [
     ("tsv", ".tsv"),
     ("words.tsv", ".words.tsv"),
 ]
+
+# Ctrl+C: 1× soft-stop after current file; 3× within this window force-aborts.
+_SIGINT_WINDOW_S = 2.0
+
+
+class _GracefulInterruptState:
+    """SIGINT: soft-stop after current recording; 3 quick presses force-abort."""
+
+    def __init__(self) -> None:
+        self.stop_after_current = False
+        self.force_abort = False
+        self._press_times: List[float] = []
+        self.current_base_name: Optional[str] = None
+        self.output_dir: Optional[Path] = None
+        self._prev_handler = None
+
+    def install(self) -> None:
+        self._prev_handler = signal.signal(signal.SIGINT, self._on_sigint)
+
+    def restore(self) -> None:
+        if self._prev_handler is not None:
+            signal.signal(signal.SIGINT, self._prev_handler)
+            self._prev_handler = None
+
+    def _on_sigint(self, signum, frame) -> None:
+        now = time.monotonic()
+        self._press_times = [t for t in self._press_times if now - t < _SIGINT_WINDOW_S]
+        self._press_times.append(now)
+        n = len(self._press_times)
+        if n >= 3:
+            self.force_abort = True
+            self.stop_after_current = True
+            print(
+                "\n  ! Force-abort: discarding in-flight work and stopping...",
+                file=sys.stderr,
+                flush=True,
+            )
+            # Restore default so a stuck abort can still be killed.
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            raise KeyboardInterrupt
+        self.stop_after_current = True
+        if n == 1:
+            print(
+                "\n  ! Ctrl+C: finishing current recording, then stopping. "
+                "Press Ctrl+C twice more quickly to force-abort.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                "\n  ! Ctrl+C again (quickly) to force-abort current recording.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _discard_transcript_outputs(output_dir: Path, base_name: str) -> List[Path]:
+    """Remove any transcript outputs for base_name so the file can be reprocessed."""
+    removed: List[Path] = []
+    output_file_path = output_dir.joinpath(base_name)
+    seen = set()
+    for _, suffix in _TRANSCRIPT_OUTPUT_SPECS:
+        a_file = output_file_path.with_suffix(suffix)
+        key = a_file.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        if a_file.exists() and a_file.is_file():
+            try:
+                a_file.unlink()
+                removed.append(a_file)
+            except OSError as e:
+                print(f"  ~ Could not remove partial output {a_file.name}: {e}")
+        ## END if a_file exists....
+    ## END for _, suffix in _TRANSCRIPT_OUTPUT_SPECS....
+
+    return removed
 
 
 def _transcript_column_for_key(key: str) -> str:
@@ -434,6 +512,9 @@ def process_recordings(
     output_files: dict = {}
     first_file_timed = True
     failed_files: List[Path] = []
+    interrupt = _GracefulInterruptState()
+    interrupt.output_dir = output_dir
+    interrupt.install()
 
     def _persist_filelist_row(row_index: object, transcript_cols: Dict[str, str]) -> None:
         if filelist_df is None or filelist_path is None:
@@ -444,94 +525,140 @@ def process_recordings(
 
         filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
 
-    for audio_path, base_name, row_index in jobs:
-        print(f"\nProcessing: {audio_path.name} (base_name={base_name!r})")
-        try:
-            ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
-            try:
-                edf_compatible_name = build_EDF_compatible_video_filename(audio_path.name)
-                print(f'\tedf_compatible_name: "{edf_compatible_name}"')
-                alias_dir.mkdir(exist_ok=True)
-                edf_compatible_path = alias_dir / edf_compatible_name
-                if not edf_compatible_path.exists():
-                    edf_compatible_path.symlink_to(audio_path.resolve())
-            except (ValueError, OSError) as e:
-                print(f"  ~ Skipping EDF alias for {audio_path.name}: {e}")
+    try:
+        for audio_path, base_name, row_index in jobs:
+            if interrupt.stop_after_current:
+                print("\nSoft-stop: not starting further recordings after Ctrl+C.")
+                break
+            ## END if interrupt.stop_after_current....
 
-            found_output_files: List[Path] = find_extant_output_files(
-                output_dir=output_dir, base_name=base_name
-            )
-            if found_output_files:
-                print(
-                    f"  ✗ Skipping {audio_path.name} as its outputs already exist: "
-                    f"{found_output_files}"
+            print(f"\nProcessing: {audio_path.name} (base_name={base_name!r})")
+            interrupt.current_base_name = base_name
+            try:
+                ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
+                try:
+                    edf_compatible_name = build_EDF_compatible_video_filename(audio_path.name)
+                    print(f'\tedf_compatible_name: "{edf_compatible_name}"')
+                    alias_dir.mkdir(exist_ok=True)
+                    edf_compatible_path = alias_dir / edf_compatible_name
+                    if not edf_compatible_path.exists():
+                        edf_compatible_path.symlink_to(audio_path.resolve())
+                except (ValueError, OSError) as e:
+                    print(f"  ~ Skipping EDF alias for {audio_path.name}: {e}")
+
+                found_output_files: List[Path] = find_extant_output_files(
+                    output_dir=output_dir, base_name=base_name
                 )
+                if found_output_files:
+                    print(
+                        f"  ✗ Skipping {audio_path.name} as its outputs already exist: "
+                        f"{found_output_files}"
+                    )
+                    if row_index is not None:
+                        _persist_filelist_row(
+                            row_index,
+                            collect_extant_transcript_paths(output_dir, base_name),
+                        )
+                    ## END if row_index is not None....
+
+                    interrupt.current_base_name = None
+                    continue
+                ## END if found_output_files....
+
+                if first_file_timed:
+                    print("  Running VAD and transcription...")
+                print("  Loading audio...")
+                t0_audio = time.perf_counter()
+                audio = whisper.load_audio(str(audio_path))
+                print("  Audio loaded.")
+                if first_file_timed:
+                    print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
+
+                t0_transcribe = time.perf_counter()
+                result = whisper.transcribe(
+                    model,
+                    audio,
+                    language="en",
+                    vad="silero",
+                    remove_empty_words=True,
+                    crisper_mode=crisper_mode,
+                )
+                if first_file_timed:
+                    print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")
+                    first_file_timed = False
+
+                curr_output_files_dict = write_results(
+                    result, output_dir=output_dir, base_name=base_name
+                )
+                for k, curr_out_files_dict in curr_output_files_dict.items():
+                    if k not in output_files:
+                        output_files[k] = dict()
+                    output_files[k].update(**curr_out_files_dict)
+                ## END for k, curr_out_files_dict in curr_output_files_dict.items()....
+
                 if row_index is not None:
                     _persist_filelist_row(
                         row_index,
-                        collect_extant_transcript_paths(output_dir, base_name),
+                        flatten_write_results_to_transcript_cols(
+                            curr_output_files_dict, base_name
+                        ),
                     )
                 ## END if row_index is not None....
 
+                interrupt.current_base_name = None
+                if interrupt.stop_after_current:
+                    print("\nSoft-stop: finished current recording after Ctrl+C; stopping.")
+                    break
+                ## END if interrupt.stop_after_current....
+
+            except KeyboardInterrupt:
+                # Force-abort (3× Ctrl+C) or interrupt that escaped soft-stop handling.
+                if interrupt.current_base_name is not None:
+                    removed = _discard_transcript_outputs(
+                        output_dir, interrupt.current_base_name
+                    )
+                    if removed:
+                        print(
+                            f"  Discarded partial outputs for {interrupt.current_base_name!r}: "
+                            f"{[p.name for p in removed]}"
+                        )
+                    else:
+                        print(
+                            f"  No transcript outputs to discard for "
+                            f"{interrupt.current_base_name!r} (safe to reprocess)."
+                        )
+                    ## END if removed....
+
+                    interrupt.current_base_name = None
+                ## END if interrupt.current_base_name....
+
+                raise
+            except Exception as e:
+                failed_files.append(audio_path)
+                print(f"  ✗ Error processing {audio_path.name}: [{type(e).__name__}] {e}")
+                if row_index is not None:
+                    # Leave transcript_* empty / unchanged for this failure; still flush CSV.
+                    filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
+                ## END if row_index is not None....
+
+                interrupt.current_base_name = None
                 continue
-            ## END if found_output_files....
-
-            if first_file_timed:
-                print("  Running VAD and transcription...")
-            print("  Loading audio...")
-            t0_audio = time.perf_counter()
-            audio = whisper.load_audio(str(audio_path))
-            print("  Audio loaded.")
-            if first_file_timed:
-                print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
-
-            t0_transcribe = time.perf_counter()
-            result = whisper.transcribe(
-                model,
-                audio,
-                language="en",
-                vad="silero",
-                remove_empty_words=True,
-                crisper_mode=crisper_mode,
-            )
-            if first_file_timed:
-                print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")
-                first_file_timed = False
-
-            curr_output_files_dict = write_results(
-                result, output_dir=output_dir, base_name=base_name
-            )
-            for k, curr_out_files_dict in curr_output_files_dict.items():
-                if k not in output_files:
-                    output_files[k] = dict()
-                output_files[k].update(**curr_out_files_dict)
-            ## END for k, curr_out_files_dict in curr_output_files_dict.items()....
-
-            if row_index is not None:
-                _persist_filelist_row(
-                    row_index,
-                    flatten_write_results_to_transcript_cols(
-                        curr_output_files_dict, base_name
-                    ),
-                )
-            ## END if row_index is not None....
-
-        except Exception as e:
-            failed_files.append(audio_path)
-            print(f"  ✗ Error processing {audio_path.name}: [{type(e).__name__}] {e}")
-            if row_index is not None:
-                # Leave transcript_* empty / unchanged for this failure; still flush CSV.
-                filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
-            ## END if row_index is not None....
-
-            continue
-    ## END for audio_path, base_name, row_index in jobs....
+            ## END try/except per file....
+        ## END for audio_path, base_name, row_index in jobs....
+    finally:
+        interrupt.restore()
+    ## END try/finally interrupt handler....
 
     if failed_files:
         print(f"\nProcessing complete with {len(failed_files)} failed file(s): {[f.name for f in failed_files]}")
     if filelist_path is not None:
         print(f"Filelist updated: {filelist_path}")
-    print(f"\nProcessing complete! Output files saved to: {output_dir.resolve()}")
+    if interrupt.stop_after_current and not interrupt.force_abort:
+        print(f"\nStopped after Ctrl+C. Output files saved to: {output_dir.resolve()}")
+    else:
+        print(f"\nProcessing complete! Output files saved to: {output_dir.resolve()}")
+    ## END if soft-stop vs complete....
+
     return output_files
 
 
@@ -560,12 +687,16 @@ if __name__ == "__main__":
     process_recordings_kwargs = dict(filelist_csv=filelist_csv, output_dir=output_dir)
 
 
-    output_files = process_recordings(
-        **process_recordings_kwargs,
-        backend="crisperwhisper",
-        model_name="medium",
-        crisper_mode="verbatim",
-        crisper_runtime="auto",  # CT2 on WSL2 with --extra crisper_ct2; transformers on Windows
-    )
+    try:
+        output_files = process_recordings(
+            **process_recordings_kwargs,
+            backend="crisperwhisper",
+            model_name="medium",
+            crisper_mode="verbatim",
+            crisper_runtime="auto",  # CT2 on WSL2 with --extra crisper_ct2; transformers on Windows
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
     print(f'All processing complete! output_files: {output_files}\n\ndone.')
 
