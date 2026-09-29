@@ -5,8 +5,9 @@ import sys
 import json
 import time
 from pathlib import Path
-from typing import List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
+import pandas as pd
 import torch
 from whisper.utils import str2bool, optional_float, optional_int
 import whisper_timestamped as whisper
@@ -86,6 +87,76 @@ _OUTPUT_SUFFIX_BY_FORMAT = {
     "srt": ".srt",
     "tsv": ".tsv",
 }
+
+# All write_results keys → on-disk suffix (for filling transcript_* on skip/re-run).
+_TRANSCRIPT_OUTPUT_SPECS: List[Tuple[str, str]] = [
+    ("json", ".words.json"),
+    ("csv", ".csv"),
+    ("words.csv", ".words.csv"),
+    ("txt", ".txt"),
+    ("vtt", ".vtt"),
+    ("words.vtt", ".words.vtt"),
+    ("srt", ".srt"),
+    ("words.srt", ".words.srt"),
+    ("tsv", ".tsv"),
+    ("words.tsv", ".words.tsv"),
+]
+
+
+def _transcript_column_for_key(key: str) -> str:
+    return f"transcript_{key.replace('.', '_')}"
+
+
+def collect_extant_transcript_paths(output_dir: Path, base_name: str) -> Dict[str, str]:
+    """Map transcript_* column -> absolute path for outputs that already exist."""
+    output_file_path = output_dir.joinpath(base_name)
+    cols: Dict[str, str] = {}
+    for key, suffix in _TRANSCRIPT_OUTPUT_SPECS:
+        a_file = output_file_path.with_suffix(suffix)
+        col = _transcript_column_for_key(key)
+        if a_file.exists() and a_file.is_file():
+            cols[col] = str(a_file.resolve())
+        else:
+            cols[col] = ""
+        ## END if a_file exists....
+    ## END for key, suffix in _TRANSCRIPT_OUTPUT_SPECS....
+
+    return cols
+
+
+def flatten_write_results_to_transcript_cols(
+    curr_output_files_dict: dict,
+    base_name: str,
+) -> Dict[str, str]:
+    """Map write_results nested dict to transcript_* absolute path strings."""
+    cols: Dict[str, str] = {
+        _transcript_column_for_key(key): "" for key, _ in _TRANSCRIPT_OUTPUT_SPECS
+    }
+    for key, by_base in curr_output_files_dict.items():
+        path = by_base.get(base_name)
+        col = _transcript_column_for_key(key)
+        if path is not None:
+            cols[col] = str(Path(path).resolve())
+        ## END if path is not None....
+    ## END for key, by_base in curr_output_files_dict.items()....
+
+    return cols
+
+
+def _is_truthy_duplicate(value: object) -> bool:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    if pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _default_output_dir_for_filelist(filelist_csv: Path) -> Path:
+    if filelist_csv.parent.name.lower() == "filelists":
+        return filelist_csv.parent.parent / "transcriptions"
+    return filelist_csv.parent / "transcriptions"
 
 
 def find_extant_output_files(output_dir: Path, base_name: str, output_formats = ['json', 'csv', 'srt', 'vtt', 'txt']) -> List[Path]:
@@ -219,7 +290,7 @@ def write_results(result, output_dir: Path, base_name: str, output_formats = ['j
 
 
 def process_recordings(
-    recordings_dir: Path,
+    recordings_dir: Optional[Path] = None,
     output_dir=None,
     video_extensions=['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v'],
     model_path_root: Path = Path(r'F:\AITEMP\whisper_models'),
@@ -227,34 +298,113 @@ def process_recordings(
     model_name: str = None,
     crisper_mode: str = "verbatim",
     crisper_runtime: str = "auto",
+    filelist_csv: Optional[Path] = None,
 ):
-    # Define the recordings directory (Windows drive ↔ /mnt/<drive> when in WSL)
-    recordings_dir = host_path(recordings_dir).resolve()
-    print(f'processing_recordings for recordings_dir: "{recordings_dir.as_posix()}"...')
-    # Create output directory
-    if output_dir is None:
-        output_dir = recordings_dir.joinpath('transcriptions').resolve()
-        # output_dir = Path("./transcriptions")
+    has_filelist = filelist_csv is not None
+    has_dir = recordings_dir is not None
+    if has_filelist == has_dir:
+        raise ValueError(
+            "Provide exactly one of filelist_csv or recordings_dir "
+            f"(got filelist_csv={filelist_csv!r}, recordings_dir={recordings_dir!r})"
+        )
+    ## END if has_filelist == has_dir....
+
+    filelist_df: Optional[pd.DataFrame] = None
+    filelist_path: Optional[Path] = None
+    # jobs: (audio_path, base_name, optional filelist row index)
+    jobs: List[Tuple[Path, str, Optional[object]]] = []
+
+    if has_filelist:
+        filelist_path = host_path(filelist_csv).resolve()
+        if not filelist_path.is_file():
+            raise FileNotFoundError(f"filelist_csv not found: {filelist_path}")
+        filelist_df = pd.read_csv(filelist_path)
+        if "full_path" not in filelist_df.columns:
+            raise ValueError(
+                f"filelist_csv missing required 'full_path' column: {filelist_path}"
+            )
+        print(f'processing_recordings for filelist_csv: "{filelist_path.as_posix()}"...')
+
+        if output_dir is None:
+            output_dir = host_path(_default_output_dir_for_filelist(filelist_path)).resolve()
+        else:
+            output_dir = host_path(output_dir).resolve()
+        ## END if output_dir is None....
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f'\t transcriptions will output to output_dir: "{output_dir.as_posix()}"')
+
+        alias_dir = output_dir.parent / "edf_video_aliases"
+        alias_dir.mkdir(exist_ok=True)
+
+        for idx, row in filelist_df.iterrows():
+            if "is_duplicate" in filelist_df.columns and _is_truthy_duplicate(
+                row.get("is_duplicate")
+            ):
+                print(f"  ~ Skipping duplicate row index={idx}")
+                continue
+            ## END if is_duplicate....
+
+            full_path_raw = row.get("full_path")
+            if pd.isna(full_path_raw) or not str(full_path_raw).strip():
+                print(f"  ! Missing full_path for row index={idx}")
+                continue
+            ## END if full_path missing....
+
+            audio_path = host_path(str(full_path_raw).strip()).resolve()
+            if not audio_path.is_file():
+                print(f"  ! Missing audio file: {audio_path}")
+                continue
+            ## END if audio missing....
+
+            name_raw = row.get("name") if "name" in filelist_df.columns else None
+            if name_raw is not None and pd.notna(name_raw) and str(name_raw).strip():
+                base_name = Path(str(name_raw).strip()).stem
+            else:
+                base_name = audio_path.stem
+            ## END if name present....
+
+            jobs.append((audio_path, base_name, idx))
+        ## END for idx, row in filelist_df.iterrows()....
+
+        # Ensure transcript_* columns exist up front.
+        for key, _ in _TRANSCRIPT_OUTPUT_SPECS:
+            col = _transcript_column_for_key(key)
+            if col not in filelist_df.columns:
+                filelist_df[col] = ""
+            ## END if col missing....
+        ## END for key, _ in _TRANSCRIPT_OUTPUT_SPECS....
     else:
-        output_dir = host_path(output_dir).resolve()
+        recordings_dir = host_path(recordings_dir).resolve()
+        print(f'processing_recordings for recordings_dir: "{recordings_dir.as_posix()}"...')
+        if output_dir is None:
+            output_dir = recordings_dir.joinpath('transcriptions').resolve()
+        else:
+            output_dir = host_path(output_dir).resolve()
+        ## END if output_dir is None....
 
-    output_dir.mkdir(exist_ok=True)
-    print(f'\t transcriptions will output to output_dir: "{output_dir.as_posix()}"')
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f'\t transcriptions will output to output_dir: "{output_dir.as_posix()}"')
 
-    # Get all video files and create alias dir before loading model (so "Found N files" appears quickly)
-    video_files = []
-    for ext in video_extensions:
-        video_files.extend(recordings_dir.glob(f"*{ext}"))
-        video_files.extend(recordings_dir.glob(f"*{ext.upper()}"))
+        video_files: List[Path] = []
+        for ext in video_extensions:
+            video_files.extend(recordings_dir.glob(f"*{ext}"))
+            video_files.extend(recordings_dir.glob(f"*{ext.upper()}"))
+        ## END for ext in video_extensions....
 
-    alias_dir = recordings_dir.parent / "edf_video_aliases"
-    alias_dir.mkdir(exist_ok=True)
+        alias_dir = recordings_dir.parent / "edf_video_aliases"
+        alias_dir.mkdir(exist_ok=True)
 
-    if not video_files:
-        print(f"No video files found in {recordings_dir}")
-        return
+        for video_file in video_files:
+            jobs.append((video_file, video_file.stem, None))
+        ## END for video_file in video_files....
+    ## END if has_filelist....
 
-    print(f"Found {len(video_files)} video files to process")
+    if not jobs:
+        print("No audio/video files to process")
+        return {}
+
+    print(f"Found {len(jobs)} file(s) to process")
 
     # Load the model once (after file discovery so progress is visible sooner)
     if model_name is None:
@@ -293,30 +443,52 @@ def process_recordings(
     output_files: dict = {}
     first_file_timed = True
     failed_files: List[Path] = []
-    # Process each video file
-    for video_file in video_files:
-        print(f"\nProcessing: {video_file.name}")
-        base_name = video_file.stem
+
+    def _persist_filelist_row(row_index: object, transcript_cols: Dict[str, str]) -> None:
+        if filelist_df is None or filelist_path is None:
+            return
+        for col, path_str in transcript_cols.items():
+            filelist_df.at[row_index, col] = path_str
+        ## END for col, path_str in transcript_cols.items()....
+
+        filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
+
+    for audio_path, base_name, row_index in jobs:
+        print(f"\nProcessing: {audio_path.name} (base_name={base_name!r})")
         try:
             ## try making a symlink with an EDF+ compatible formatted name: https://www.edfplus.info/specs/video.html
             try:
-                edf_compatible_name = build_EDF_compatible_video_filename(video_file.name)
+                edf_compatible_name = build_EDF_compatible_video_filename(audio_path.name)
                 print(f'\tedf_compatible_name: "{edf_compatible_name}"')
                 edf_compatible_path = alias_dir / edf_compatible_name
                 if not edf_compatible_path.exists():
-                    edf_compatible_path.symlink_to(video_file.resolve())
+                    edf_compatible_path.symlink_to(audio_path.resolve())
             except (ValueError, OSError) as e:
-                print(f"  ~ Skipping EDF alias for {video_file.name}: {e}")
+                print(f"  ~ Skipping EDF alias for {audio_path.name}: {e}")
 
-            found_output_files: List[Path] = find_extant_output_files(output_dir=output_dir, base_name=base_name)
+            found_output_files: List[Path] = find_extant_output_files(
+                output_dir=output_dir, base_name=base_name
+            )
             if found_output_files:
-                print(f"  ✗ Skipping {video_file.name} as its outputs already exist: {found_output_files}")
+                print(
+                    f"  ✗ Skipping {audio_path.name} as its outputs already exist: "
+                    f"{found_output_files}"
+                )
+                if row_index is not None:
+                    _persist_filelist_row(
+                        row_index,
+                        collect_extant_transcript_paths(output_dir, base_name),
+                    )
+                ## END if row_index is not None....
+
                 continue
+            ## END if found_output_files....
+
             if first_file_timed:
                 print("  Running VAD and transcription...")
             print("  Loading audio...")
             t0_audio = time.perf_counter()
-            audio = whisper.load_audio(str(video_file))
+            audio = whisper.load_audio(str(audio_path))
             print("  Audio loaded.")
             if first_file_timed:
                 print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
@@ -334,20 +506,39 @@ def process_recordings(
                 print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")
                 first_file_timed = False
 
-            base_name = video_file.stem
-            curr_output_files_dict = write_results(result, output_dir=output_dir, base_name=base_name)
+            curr_output_files_dict = write_results(
+                result, output_dir=output_dir, base_name=base_name
+            )
             for k, curr_out_files_dict in curr_output_files_dict.items():
                 if k not in output_files:
                     output_files[k] = dict()
                 output_files[k].update(**curr_out_files_dict)
+            ## END for k, curr_out_files_dict in curr_output_files_dict.items()....
+
+            if row_index is not None:
+                _persist_filelist_row(
+                    row_index,
+                    flatten_write_results_to_transcript_cols(
+                        curr_output_files_dict, base_name
+                    ),
+                )
+            ## END if row_index is not None....
 
         except Exception as e:
-            failed_files.append(video_file)
-            print(f"  ✗ Error processing {video_file.name}: [{type(e).__name__}] {e}")
+            failed_files.append(audio_path)
+            print(f"  ✗ Error processing {audio_path.name}: [{type(e).__name__}] {e}")
+            if row_index is not None:
+                # Leave transcript_* empty / unchanged for this failure; still flush CSV.
+                filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
+            ## END if row_index is not None....
+
             continue
+    ## END for audio_path, base_name, row_index in jobs....
 
     if failed_files:
         print(f"\nProcessing complete with {len(failed_files)} failed file(s): {[f.name for f in failed_files]}")
+    if filelist_path is not None:
+        print(f"Filelist updated: {filelist_path}")
     print(f"\nProcessing complete! Output files saved to: {output_dir.resolve()}")
     return output_files
 
@@ -365,21 +556,19 @@ if __name__ == "__main__":
     # Windows-style paths; host_path() maps to /mnt/<drive>/... under WSL2.
     # recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
     # output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
-
+    # process_recordings_kwargs = dict(recordings_dir=recordings_dir, output_dir=output_dir)
     
     # ==================================================================================================================================================================================================================================================================================== #
     # `Just Press Record` iOS App Transcription                                                                                                                                                                                                                                            #
     # ==================================================================================================================================================================================================================================================================================== #
     # "H:/backups/2026-09-21_iPhone15Pro/Just Press Record/2023-08-10/16-12-39.m4a" -> parse to name "2023-08-10_16-12-39.m4a"
-    recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/Just Press Record")
+    filelist_csv = host_path("H:/backups/2026-09-21_iPhone15Pro/Just Press Record/filelists/2026-09-29_jpr_audio_file_list.csv")
     output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/Just Press Record/transcriptions")
+    process_recordings_kwargs = dict(filelist_csv=filelist_csv, output_dir=output_dir)
 
-    video_extensions = ['.m4a']
 
     output_files = process_recordings(
-        recordings_dir=recordings_dir,
-        output_dir=output_dir,
-        video_extensions=video_extensions,
+        **process_recordings_kwargs,
         backend="crisperwhisper",
         model_name="medium",
         crisper_mode="verbatim",
