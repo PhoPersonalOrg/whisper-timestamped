@@ -234,7 +234,10 @@ def token_lcs_transcribe_with_word_timestamps(
             # Same segmentation extract_word_timings uses internally: maps each
             # content token (by its position in ``gen_ids``) to its word index,
             # so provenance tags can be resolved to per-chunk word timings.
-            tok_pieces = [engine.tokenizer.decode([t]) for t in gen_ids]
+            tok_pieces = [
+                engine.tokenizer.decode([t], clean_up_tokenization_spaces=False)
+                for t in gen_ids
+            ]
             word_token_indices, _ = segment_tokens_into_words(
                 engine, gen_ids, tok_pieces, language=prompt_builder.language,
             )
@@ -275,7 +278,10 @@ def token_lcs_transcribe_with_word_timestamps(
 
     # Segment the merged token sequence into words and time each word from
     # its source-chunk Viterbi alignment via the provenance tags.
-    merged_pieces = [engine.tokenizer.decode([t]) for t in merged_tokens]
+    merged_pieces = [
+        engine.tokenizer.decode([t], clean_up_tokenization_spaces=False)
+        for t in merged_tokens
+    ]
     merged_word_groups, _ = segment_tokens_into_words(
         engine, merged_tokens, merged_pieces,
         language=prompt_builder.language,

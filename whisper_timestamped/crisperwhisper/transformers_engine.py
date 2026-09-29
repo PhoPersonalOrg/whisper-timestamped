@@ -11,14 +11,14 @@ Differences from the CTranslate2 backend:
 
 * No speculative decoding (the draft/verify attention stitching depends on
   the CT2 fork's KV primitives).
-* Cross-attention for word timing is captured **inline during generation**
-  (``generate(output_attentions=True, return_dict_in_generate=True)``) in a
-  single pass -- no separate teacher-forced re-run -- to mirror the CT2
-  backend's on-the-fly capture.  This requires the model to be loaded with
-  eager attention (``attn_implementation="eager"``); SDPA / flash attention
-  do not return attention weights.  The teacher-forced single pass
-  (:meth:`TransformersEngine._cross_attention_rows`) is retained only as the
-  *forced-aligner* primitive (known token sequence in, attention out).
+* Cross-attention for word timing is captured via a teacher-forced forward
+  pass after greedy decode (``output_attentions=True`` on ``model(...)``),
+  not via ``generate(output_attentions=True)`` — Whisper's generate path
+  re-injects that flag alongside ``generation_config`` and warns on
+  transformers 5.x.  The model is still loaded with eager attention
+  (``attn_implementation="eager"``); SDPA / flash attention do not return
+  attention weights.  :meth:`TransformersEngine._cross_attention_rows` is
+  the forced-aligner primitive (known token sequence in, attention out).
 * Slower than CTranslate2 (no fused kernels / int8).
 
 Requires the ``crisperwhisper[transformers]`` extra (``transformers`` +
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -138,12 +138,21 @@ class TransformersEngine:
             model_name_or_path, device, self.torch_dtype,
         )
         self.processor = AutoProcessor.from_pretrained(model_name_or_path)
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_name_or_path,
-            torch_dtype=self.torch_dtype,
-            attn_implementation="eager",  # required for output_attentions
-            low_cpu_mem_usage=True,
-        ).to(self.device)
+        # Silence the expected UNEXPECTED encoder_blank_head LOAD REPORT
+        # (Crisper-specific head unused by stock WhisperForConditionalGeneration).
+        from transformers.utils import logging as hf_logging
+
+        _prev_verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        try:
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name_or_path,
+                dtype=self.torch_dtype,
+                attn_implementation="eager",  # required for output_attentions
+                low_cpu_mem_usage=True,
+            ).to(self.device)
+        finally:
+            hf_logging.set_verbosity(_prev_verbosity)
         self.model.eval()
 
         # We always force the exact decoder prompt ourselves via
@@ -159,12 +168,19 @@ class TransformersEngine:
         self.model.config.begin_suppress_tokens = None
 
         self.tokenizer = self.processor.tokenizer
+        # BPE WhisperTokenizer: cleanup strips spaces before punctuation.
+        self.tokenizer.clean_up_tokenization_spaces = False
         # 128-mel fallback matches CT2Engine's N_MELS (all v2 checkpoints are
         # v3-family, 128 bins); the processor config normally provides it.
         self.n_mels = int(getattr(self.processor.feature_extractor, "feature_size", 128))
 
         self._build_special_ids()
         self._load_generation_defaults()
+        # Avoid fighting per-call GenerationConfig: checkpoint max_length=448
+        # would collide with max_new_tokens, and suppress_tokens on the stored
+        # config would duplicate SuppressTokensLogitsProcessor.
+        self.model.generation_config.max_length = None
+        self.model.generation_config.suppress_tokens = None
         self._alignment_heads: list[tuple[int, int]] | None = None
 
         logger.info(
@@ -297,7 +313,7 @@ class TransformersEngine:
         ids = [int(t) for t in token_ids]
         if skip_special:
             ids = [t for t in ids if t not in self.all_special_ids]
-        return self.tokenizer.decode(ids)
+        return self.tokenizer.decode(ids, clean_up_tokenization_spaces=False)
 
     # ------------------------------------------------------------------
     # Feature extraction.
@@ -333,6 +349,57 @@ class TransformersEngine:
     # Generation.
     # ------------------------------------------------------------------
 
+    def _encoder_attention_mask(self, features):
+        """Ones mask over mel frames (unpadded 30s chunks)."""
+        import torch
+
+        return torch.ones(
+            features.shape[0],
+            features.shape[-1],
+            device=features.device,
+            dtype=torch.long,
+        )
+
+    def _generate_kwargs(
+        self,
+        features,
+        decoder_input_ids,
+        *,
+        max_new_tokens: int,
+        suppress_tokens: list[int] | None = None,
+        num_beams: int = 1,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        logits_processor=None,
+    ) -> dict[str, Any]:
+        """Build kwargs-only ``generate`` args (no ``generation_config=``).
+
+        HuggingFace 5.x merges global defaults (``max_length=20``) into a
+        provided ``GenerationConfig`` when fields are ``None``, which collides
+        with ``max_new_tokens``.  Passing kwargs only and setting
+        ``max_length=None`` explicitly overrides that default after the merge.
+        Do not set ``output_attentions`` here: Whisper's ``generate_with_fallback``
+        re-passes it alongside ``generation_config`` into ``super().generate``,
+        triggering a deprecation warning; use teacher-forced attention instead.
+        """
+        kwargs: dict[str, Any] = dict(
+            decoder_input_ids=decoder_input_ids,
+            attention_mask=self._encoder_attention_mask(features),
+            max_new_tokens=int(max_new_tokens),
+            max_length=None,
+            num_beams=int(num_beams),
+            do_sample=bool(do_sample),
+            suppress_tokens=list(self._resolve_suppress(suppress_tokens)),
+            use_cache=True,
+        )
+        if do_sample:
+            kwargs["temperature"] = float(temperature)
+            kwargs["top_k"] = int(top_k)  # 0 disables top-k filtering in HF
+        if logits_processor is not None:
+            kwargs["logits_processor"] = logits_processor
+        return kwargs
+
     def _run_generate(
         self,
         features,
@@ -359,28 +426,23 @@ class TransformersEngine:
             return []
 
         dec = torch.tensor([list(prefix)], device=self.device, dtype=torch.long)
-        # Always pass the resolved list (matching the CT2 backend): an explicit
-        # ``[]`` must *disable* suppression rather than fall back to the
-        # model's generation_config default.
-        sup = self._resolve_suppress(suppress_tokens)
-
-        kwargs: dict = dict(
-            decoder_input_ids=dec,
-            max_new_tokens=int(max_new),
-            num_beams=int(num_beams),
-            do_sample=bool(do_sample),
-            suppress_tokens=list(sup),
-        )
-        if do_sample:
-            kwargs["temperature"] = float(temperature)
-            kwargs["top_k"] = int(top_k)  # 0 disables top-k filtering in HF
+        procs = None
         if ban_first:
             procs = LogitsProcessorList()
             procs.append(_FirstStepBan(len(prefix), list(ban_first)))
-            kwargs["logits_processor"] = procs
-
+        gen_kwargs = self._generate_kwargs(
+            features,
+            dec,
+            max_new_tokens=int(max_new),
+            suppress_tokens=suppress_tokens,
+            num_beams=int(num_beams),
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            top_k=int(top_k),
+            logits_processor=procs,
+        )
         with torch.no_grad():
-            out = self.model.generate(features, **kwargs)
+            out = self.model.generate(features, **gen_kwargs)
 
         seq = [int(t) for t in out[0].tolist()]
         if seq[: len(prefix)] == list(prefix):
@@ -435,46 +497,27 @@ class TransformersEngine:
         ban_first: set[int] | None = None,
         suppress_tokens: list[int] | None = None,
     ) -> tuple[list[int], np.ndarray]:
-        """Greedy decode forcing ``prefix``, capturing cross-attention inline.
+        """Greedy decode forcing ``prefix``, then teacher-forced cross-attention.
 
-        Single forward-generation pass (no teacher-forced re-run): returns
-        ``(gen_ids, attention)`` where ``attention`` is the head-averaged
-        ``[len(gen_ids), F_enc]`` matrix, 1-to-1 with ``gen_ids`` (row ``k``
-        predicts ``gen_ids[k]``).  Requires :meth:`enable_attention` first.
+        Two-pass on the transformers backend: decode without
+        ``output_attentions`` (avoids a HuggingFace Whisper deprecation where
+        ``generate_with_fallback`` re-passes attentions alongside
+        ``generation_config``), then :meth:`_cross_attention_rows` for the
+        same ``[len(gen_ids), F_enc]`` matrix used by word timing.
+        Requires :meth:`enable_attention` first.
         """
-        import torch
-        from transformers import LogitsProcessorList
-
-        heads = self._resolved_alignment_heads()
+        self._resolved_alignment_heads()  # validate early
         if max_new <= 0:
             return [], np.zeros((0, 0), dtype=np.float32)
 
-        dec = torch.tensor([list(prefix)], device=self.device, dtype=torch.long)
-        sup = self._resolve_suppress(suppress_tokens)
-
-        kwargs: dict = dict(
-            decoder_input_ids=dec,
-            max_new_tokens=int(max_new),
-            num_beams=1,
-            do_sample=False,
-            return_dict_in_generate=True,
-            output_attentions=True,
-            use_cache=True,
-            suppress_tokens=list(sup),
+        gen_ids = self._run_generate(
+            features,
+            prefix,
+            max_new,
+            ban_first=ban_first,
+            suppress_tokens=suppress_tokens,
         )
-        if ban_first:
-            procs = LogitsProcessorList()
-            procs.append(_FirstStepBan(len(prefix), list(ban_first)))
-            kwargs["logits_processor"] = procs
-
-        with torch.no_grad():
-            out = self.model.generate(features, **kwargs)
-
-        seq = [int(t) for t in out.sequences[0].tolist()]
-        gen_ids = seq[len(prefix):] if seq[: len(prefix)] == list(prefix) else seq
-        attention = self._stack_step_attention(
-            out.cross_attentions, heads, len(gen_ids),
-        )
+        attention = self._cross_attention_rows(features, list(prefix), list(gen_ids))
         return gen_ids, attention
 
     def generate(
@@ -597,12 +640,17 @@ class TransformersEngine:
             prefix_len=len(prompt_tokens), eot_id=self.eot_id,
             suppress_ids=sup, min_new_tokens=int(min_new_tokens),
         )
+        gen_kwargs = self._generate_kwargs(
+            features,
+            dec,
+            max_new_tokens=int(max_length),
+            suppress_tokens=suppress_tokens,
+            num_beams=1,
+            do_sample=False,
+            logits_processor=LogitsProcessorList([gate]),
+        )
         with torch.no_grad():
-            out = self.model.generate(
-                features, decoder_input_ids=dec, max_new_tokens=int(max_length),
-                num_beams=1, do_sample=False, suppress_tokens=list(sup),
-                logits_processor=LogitsProcessorList([gate]),
-            )
+            out = self.model.generate(features, **gen_kwargs)
         seq = [int(t) for t in out[0].tolist()]
         gen = (
             seq[len(prompt_tokens):]

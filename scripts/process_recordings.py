@@ -323,7 +323,6 @@ def process_recordings(
         print(f'\t transcriptions will output to output_dir: "{output_dir.as_posix()}"')
 
         alias_dir = output_dir.parent / "edf_video_aliases"
-        alias_dir.mkdir(exist_ok=True)
 
         for idx, row in filelist_df.iterrows():
             # Skip non-keepers flagged by extract_m4a_creation_times (bool or "true"/"1"/"yes")
@@ -386,7 +385,6 @@ def process_recordings(
         ## END for ext in video_extensions....
 
         alias_dir = recordings_dir.parent / "edf_video_aliases"
-        alias_dir.mkdir(exist_ok=True)
 
         for video_file in video_files:
             jobs.append((video_file, video_file.stem, None))
@@ -453,6 +451,7 @@ def process_recordings(
             try:
                 edf_compatible_name = build_EDF_compatible_video_filename(audio_path.name)
                 print(f'\tedf_compatible_name: "{edf_compatible_name}"')
+                alias_dir.mkdir(exist_ok=True)
                 edf_compatible_path = alias_dir / edf_compatible_name
                 if not edf_compatible_path.exists():
                     edf_compatible_path.symlink_to(audio_path.resolve())

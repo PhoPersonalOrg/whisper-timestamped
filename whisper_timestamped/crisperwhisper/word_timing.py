@@ -631,7 +631,10 @@ def extract_word_timings(
     # evaluation/timing_extractors.py).  Space-less languages have no
     # space boundaries to split on and would collapse into a single word
     # (issue #58), so they group at codepoint boundaries instead.
-    tok_pieces = [engine.tokenizer.decode([t]) for t in gen_ids]
+    tok_pieces = [
+        engine.tokenizer.decode([t], clean_up_tokenization_spaces=False)
+        for t in gen_ids
+    ]
     word_token_indices, _ = segment_tokens_into_words(
         engine, gen_ids, tok_pieces, language=language,
     )
