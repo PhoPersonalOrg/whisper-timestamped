@@ -7,13 +7,13 @@ todos:
     status: completed
   - id: transformers-engine
     content: Use helper for AutoProcessor / AutoModelForSpeechSeq2Seq.from_pretrained
-    status: in_progress
+    status: completed
   - id: version-probe
     content: Short-circuit official v2 ids; wrap hf_hub_download with fallback
-    status: pending
+    status: completed
   - id: ct2-converter
     content: Check CT2 conversion cache before Hub; wrap snapshot_download with fallback
-    status: pending
+    status: completed
 isProject: false
 ---
 

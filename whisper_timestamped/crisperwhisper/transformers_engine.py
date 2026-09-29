@@ -133,11 +133,17 @@ class TransformersEngine:
         self.torch_dtype = _resolve_torch_dtype(compute_type)
         self.model_path = str(model_name_or_path)
 
+        from whisper_timestamped.crisperwhisper.hub_offline import (
+            call_with_local_files_fallback,
+        )
+
         logger.info(
             "Loading Transformers model %s on %s (%s)...",
             model_name_or_path, device, self.torch_dtype,
         )
-        self.processor = AutoProcessor.from_pretrained(model_name_or_path)
+        self.processor = call_with_local_files_fallback(
+            AutoProcessor.from_pretrained, model_name_or_path,
+        )
         # Silence the expected UNEXPECTED encoder_blank_head LOAD REPORT
         # (Crisper-specific head unused by stock WhisperForConditionalGeneration).
         from transformers.utils import logging as hf_logging
@@ -145,7 +151,8 @@ class TransformersEngine:
         _prev_verbosity = hf_logging.get_verbosity()
         hf_logging.set_verbosity_error()
         try:
-            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            self.model = call_with_local_files_fallback(
+                AutoModelForSpeechSeq2Seq.from_pretrained,
                 model_name_or_path,
                 dtype=self.torch_dtype,
                 attn_implementation="eager",  # required for output_attentions

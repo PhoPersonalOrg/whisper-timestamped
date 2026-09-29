@@ -56,6 +56,19 @@ def _check_local_dir(path: Path) -> int | None:
     return None
 
 
+def _is_official_v2_id(model_name_or_path: str) -> bool:
+    """True for known CrisperWhisper 2.0 Hub ids (no Hub I/O needed)."""
+    from whisper_timestamped.crisperwhisper.model import OFFICIAL_MODELS
+
+    if model_name_or_path in OFFICIAL_MODELS.values():
+        return True
+    # Accept future size tags under the same org/prefix.
+    name = model_name_or_path.split("/")[-1]
+    return model_name_or_path.startswith("nyralabs/") and name.startswith(
+        "CrisperWhisper2.0_"
+    )
+
+
 def detect_model_version(model_name_or_path: str) -> int:
     """Detect CrisperWhisper model version without loading the full model.
 
@@ -69,10 +82,23 @@ def detect_model_version(model_name_or_path: str) -> int:
             logger.info("Detected CrisperWhisper v%d from local dir", result)
             return result
 
+    if _is_official_v2_id(model_name_or_path):
+        logger.info("Detected CrisperWhisper v2 from official model id")
+        return 2
+
+    from whisper_timestamped.crisperwhisper.hub_offline import (
+        call_with_local_files_fallback,
+    )
+
     for filename in ("added_tokens.json", "vocab.json", "tokenizer.json"):
         try:
             from huggingface_hub import hf_hub_download
-            local = Path(hf_hub_download(model_name_or_path, filename))
+
+            local = Path(
+                call_with_local_files_fallback(
+                    hf_hub_download, model_name_or_path, filename,
+                )
+            )
             result = _check_local_dir(local.parent)
             if result is not None:
                 logger.info("Detected CrisperWhisper v%d from HF Hub", result)

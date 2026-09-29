@@ -54,8 +54,13 @@ def _resolve_hf_or_local(model_name_or_path: str) -> Path:
 
     from huggingface_hub import snapshot_download
 
+    from whisper_timestamped.crisperwhisper.hub_offline import (
+        call_with_local_files_fallback,
+    )
+
     logger.info("Downloading %s from HuggingFace Hub ...", model_name_or_path)
-    local = snapshot_download(
+    local = call_with_local_files_fallback(
+        snapshot_download,
         model_name_or_path,
         allow_patterns=["*.json", "*.bin", "*.safetensors", "*.txt", "*.model"],
     )
@@ -170,22 +175,23 @@ def ensure_ct2_model(
         Where to store converted models.  Defaults to
         ``~/.cache/crisperwhisper/`` or ``$CRISPERWHISPER_CACHE``.
     """
+    # Prefer an existing CT2 conversion cache before any Hub download so
+    # offline loads work when the model was converted on a previous run.
+    cache_root = Path(cache_dir) if cache_dir else _DEFAULT_CACHE
+    key = _cache_key(model_name_or_path, quantization)
+    ct2_dir = cache_root / key
+    marker = ct2_dir / ".conversion_complete"
+    if ct2_dir.exists() and marker.exists():
+        logger.info("Using cached CT2 model at %s", ct2_dir)
+        return ct2_dir
+
     model_dir = _resolve_hf_or_local(model_name_or_path)
 
     if _is_ct2_model(model_dir):
         logger.info("Model at %s is already in CT2 format.", model_dir)
         return model_dir
 
-    cache_root = Path(cache_dir) if cache_dir else _DEFAULT_CACHE
     cache_root.mkdir(parents=True, exist_ok=True)
-
-    key = _cache_key(model_name_or_path, quantization)
-    ct2_dir = cache_root / key
-
-    marker = ct2_dir / ".conversion_complete"
-    if ct2_dir.exists() and marker.exists():
-        logger.info("Using cached CT2 model at %s", ct2_dir)
-        return ct2_dir
 
     logger.info(
         "Converting %s -> CT2 (%s) at %s ...",
