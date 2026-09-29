@@ -549,8 +549,9 @@ if __name__ == "__main__":
     # Windows-style paths; host_path() maps to /mnt/<drive>/... under WSL2.
     # recordings_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE")
     # output_dir = host_path(r"H:/backups/2026-09-21_iPhone15Pro/WhisperApp/transcriptions")
-    # process_recordings_kwargs = dict(recordings_dir=recordings_dir, output_dir=output_dir)
-    
+    # video_extensions = None
+    # process_recordings_kwargs = dict(recordings_dir=recordings_dir, output_dir=output_dir, video_extensions=video_extensions)
+
     # ==================================================================================================================================================================================================================================================================================== #
     # `Just Press Record` iOS App Transcription                                                                                                                                                                                                                                            #
     # ==================================================================================================================================================================================================================================================================================== #
