@@ -24,6 +24,7 @@ from whisper_timestamped.recording_formats.registry import (
 )
 from whisper_timestamped.recording_formats.voice_memos import (
     VoiceMemosFormat,
+    load_voice_memos_metadata,
     load_voice_memos_titles,
     parse_voice_memos_filename,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "detect_format",
     "get_format",
     "list_format_ids",
+    "load_voice_memos_metadata",
     "load_voice_memos_titles",
     "parse_just_press_record_path",
     "parse_voice_memos_filename",

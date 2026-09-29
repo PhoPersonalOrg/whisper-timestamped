@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,11 @@ from whisper_timestamped.recording_formats.just_press_record import (
 from whisper_timestamped.recording_formats.rec_continuous import (
     RecContinuousFormat,
 )
-from whisper_timestamped.recording_formats.voice_memos import VoiceMemosFormat
+from whisper_timestamped.recording_formats.voice_memos import (
+    VoiceMemosFormat,
+    load_voice_memos_metadata,
+    load_voice_memos_titles,
+)
 
 
 class TestFormatRegistry(unittest.TestCase):
@@ -97,6 +102,72 @@ class TestJustPressRecord(unittest.TestCase):
             self.assertEqual(detected.id, "just_press_record")
 
 
+def _write_synthetic_cloud_recordings_db(db_path: Path) -> None:
+    """Minimal CloudRecordings.db for unit tests."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE ZFOLDER (
+                Z_PK INTEGER PRIMARY KEY,
+                ZENCRYPTEDNAME VARCHAR
+            );
+            CREATE TABLE ZCLOUDRECORDING (
+                Z_PK INTEGER PRIMARY KEY,
+                ZPATH VARCHAR,
+                ZENCRYPTEDTITLE VARCHAR,
+                ZCUSTOMLABELFORSORTING VARCHAR,
+                ZCUSTOMLABEL VARCHAR,
+                ZDATE FLOAT,
+                ZDURATION FLOAT,
+                ZUNIQUEID VARCHAR,
+                ZFOLDER INTEGER
+            );
+            INSERT INTO ZFOLDER (Z_PK, ZENCRYPTEDNAME) VALUES (1, 'Offline');
+            INSERT INTO ZCLOUDRECORDING (
+                Z_PK, ZPATH, ZENCRYPTEDTITLE, ZCUSTOMLABELFORSORTING,
+                ZCUSTOMLABEL, ZDATE, ZDURATION, ZUNIQUEID, ZFOLDER
+            ) VALUES (
+                1,
+                '20190415 200101-4FA3EFA0.m4a',
+                'Home',
+                'Home',
+                '2019-04-16T00:01:01Z',
+                577065661.201911,
+                179.3,
+                '4FA3EFA0-A687-4687-A787-50F6EB45B8F7',
+                NULL
+            );
+            INSERT INTO ZCLOUDRECORDING (
+                Z_PK, ZPATH, ZENCRYPTEDTITLE, ZCUSTOMLABELFORSORTING,
+                ZCUSTOMLABEL, ZDATE, ZDURATION, ZUNIQUEID, ZFOLDER
+            ) VALUES (
+                2,
+                '20211028 230533-479E0A4C.m4a',
+                '3081 Promenade Cir 2',
+                '3081 Promenade Cir 2',
+                NULL,
+                657169533.384722,
+                2229.2,
+                '479E0A4C-A40F-46BA-866C-5E1EB79FA278',
+                1
+            );
+            -- orphan row with no path should be skipped
+            INSERT INTO ZCLOUDRECORDING (
+                Z_PK, ZPATH, ZENCRYPTEDTITLE, ZCUSTOMLABELFORSORTING,
+                ZCUSTOMLABEL, ZDATE, ZDURATION, ZUNIQUEID, ZFOLDER
+            ) VALUES (
+                3, NULL, 'Home 3', 'Home 3', NULL, 1.0, 1.0, 'NO-PATH', NULL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    ## END try/finally write synthetic db....
+
+
 class TestVoiceMemos(unittest.TestCase):
     def test_parse_with_id(self):
         path = Path("20190415 200101-4FA3EAF0.m4a")
@@ -144,11 +215,104 @@ class TestVoiceMemos(unittest.TestCase):
             # Point format at temp root so DB lookup misses quietly.
             fmt.default_recordings_dir = audio
             fmt._voice_memos_root = Path(tmp)
-            fmt._title_cache = {}
+            fmt._meta_cache = {}
+            fmt._encoder_cache = {
+                "20190415 200101-4FA3EAF0.m4a": "",
+            }
             rows = fmt.build_filelist_rows(audio)
             self.assertEqual(len(rows), 1)
             self.assertIn("title", rows[0])
             self.assertEqual(rows[0]["name"], "20190415 200101-4FA3EAF0.m4a")
+            self.assertEqual(rows[0]["title"], "")
+            self.assertEqual(rows[0]["apple_transcript"], "")
+
+    def test_load_metadata_from_synthetic_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = (
+                Path(tmp)
+                / "group.com.apple.VoiceMemos.shared"
+                / "Recordings"
+                / "CloudRecordings.db"
+            )
+            _write_synthetic_cloud_recordings_db(db)
+            meta = load_voice_memos_metadata(db)
+            self.assertEqual(set(meta), {
+                "20190415 200101-4FA3EFA0.m4a",
+                "20211028 230533-479E0A4C.m4a",
+            })
+            home = meta["20190415 200101-4FA3EFA0.m4a"]
+            self.assertEqual(home["title"], "Home")
+            self.assertEqual(home["duration_seconds"], 179.3)
+            self.assertEqual(home["recorded_at_utc"], "2019-04-16 00:01:01")
+            self.assertEqual(
+                home["unique_id"],
+                "4FA3EFA0-A687-4687-A787-50F6EB45B8F7",
+            )
+            self.assertEqual(home["folder"], "")
+
+            promenade = meta["20211028 230533-479E0A4C.m4a"]
+            self.assertEqual(promenade["title"], "3081 Promenade Cir 2")
+            self.assertEqual(promenade["folder"], "Offline")
+            # ZDATE fallback when ZCUSTOMLABEL is null
+            self.assertEqual(promenade["recorded_at_utc"], "2021-10-29 03:05:33")
+
+            titles = load_voice_memos_titles(db)
+            self.assertEqual(titles["20190415 200101-4FA3EFA0.m4a"], "Home")
+
+    def test_load_metadata_missing_db(self):
+        missing = Path("/nonexistent/CloudRecordings.db")
+        self.assertEqual(load_voice_memos_metadata(missing), {})
+        self.assertEqual(load_voice_memos_titles(missing), {})
+
+    def test_extra_row_fields_from_db_and_transcript(self):
+        fmt = VoiceMemosFormat()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "audio"
+            audio.mkdir()
+            media = audio / "20190415 200101-4FA3EFA0.m4a"
+            media.write_bytes(b"x")
+            (root / "transcripts").mkdir()
+            tx = root / "transcripts" / "Home.txt"
+            tx.write_text("hello", encoding="utf-8")
+            db = (
+                root
+                / "group.com.apple.VoiceMemos.shared"
+                / "Recordings"
+                / "CloudRecordings.db"
+            )
+            _write_synthetic_cloud_recordings_db(db)
+
+            fmt._voice_memos_root = root
+            fmt.default_recordings_dir = audio
+            fmt._meta_cache = None
+            fmt._encoder_cache = {media.name: "com.apple.VoiceMemos (test)"}
+
+            fields = fmt.extra_row_fields(media)
+            self.assertEqual(fields["title"], "Home")
+            self.assertEqual(fields["duration_seconds"], 179.3)
+            self.assertEqual(fields["recorded_at_utc"], "2019-04-16 00:01:01")
+            self.assertEqual(
+                fields["unique_id"],
+                "4FA3EFA0-A687-4687-A787-50F6EB45B8F7",
+            )
+            self.assertEqual(fields["folder"], "")
+            self.assertEqual(fields["apple_transcript"], str(tx))
+            self.assertEqual(fields["encoder"], "com.apple.VoiceMemos (test)")
+
+            rows = fmt.build_filelist_rows(audio)
+            self.assertEqual(len(rows), 1)
+            for col in (
+                "title",
+                "duration_seconds",
+                "recorded_at_utc",
+                "unique_id",
+                "folder",
+                "apple_transcript",
+                "encoder",
+            ):
+                self.assertIn(col, rows[0])
+            ## END for col in extra columns....
 
 
 class TestIOSWhisperApp(unittest.TestCase):
@@ -190,13 +354,19 @@ class TestEnsureFilelist(unittest.TestCase):
             audio.mkdir()
             (audio / "20190415 200101-4FA3EAF0.m4a").write_bytes(b"xx")
             csv_path = Path(tmp) / "filelists" / "test.csv"
-            fmt._title_cache = {}
+            fmt._voice_memos_root = Path(tmp)
+            fmt._meta_cache = {}
+            fmt._encoder_cache = {"20190415 200101-4FA3EAF0.m4a": ""}
             n = fmt.ensure_filelist_csv(csv_path, recordings_dir=audio)
             self.assertEqual(n, 1)
             self.assertTrue(csv_path.is_file())
             text = csv_path.read_text(encoding="utf-8")
             self.assertIn("full_path", text)
             self.assertIn("title", text)
+            self.assertIn("duration_seconds", text)
+            self.assertIn("recorded_at_utc", text)
+            self.assertIn("apple_transcript", text)
+            self.assertIn("encoder", text)
             self.assertIn("20190415 200101-4FA3EAF0.m4a", text)
 
 
