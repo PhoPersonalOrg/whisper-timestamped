@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import html
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from PyQt6.QtCore import Qt, QTimer
@@ -29,6 +32,7 @@ from PyQt6.QtWidgets import (
     QSlider,
     QStatusBar,
     QTableView,
+    QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -67,6 +71,20 @@ def _format_time(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _parse_timestamp_to_seconds(ts_str: str) -> float:
+    """Parse '00:01:23,456' or '01:23.456' to float seconds."""
+    s = ts_str.replace(",", ".").strip()
+    parts = s.split(":")
+    try:
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        return float(s)
+    except (ValueError, IndexError):
+        return 0.0
 
 
 class MainWindow(QMainWindow):
@@ -240,27 +258,10 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(header_layout)
 
-        # Format selector row
-        format_layout = QHBoxLayout()
-        format_lbl = QLabel("Format:")
-        format_lbl.setObjectName("dimLabel")
-        format_layout.addWidget(format_lbl)
-
-        self._preview_format_combo = QComboBox()
-        self._preview_format_combo.addItem("Plain Text (.txt)", "transcript_txt")
-        self._preview_format_combo.addItem("Subtitles (.srt)", "transcript_srt")
-        self._preview_format_combo.addItem("Word Subtitles (.words.srt)", "transcript_words_srt")
-        self._preview_format_combo.addItem("Word Timestamps CSV (.words.csv)", "transcript_words_csv")
-        self._preview_format_combo.addItem("JSON Timestamps (.words.json)", "transcript_json")
-        self._preview_format_combo.addItem("WebVTT (.vtt)", "transcript_vtt")
-        self._preview_format_combo.currentIndexChanged.connect(self._on_preview_format_changed)
-        format_layout.addWidget(self._preview_format_combo, stretch=1)
-        layout.addLayout(format_layout)
-
-        # Transcript text editor
-        self._preview_text = QPlainTextEdit()
+        # Transcript viewer editor (rich formatted with timestamps)
+        self._preview_text = QTextEdit()
         self._preview_text.setReadOnly(True)
-        self._preview_text.setPlaceholderText("Select a recording from the table to preview its transcript…")
+        self._preview_text.setPlaceholderText("Select a recording from the table to view its transcript…")
         layout.addWidget(self._preview_text, stretch=1)
 
         dock.setWidget(container)
@@ -782,11 +783,11 @@ class MainWindow(QMainWindow):
 
 
     def _update_transcript_preview(self, row_data: Optional[pd.Series]) -> None:
-        """Display the transcript for the currently selected row in the preview panel."""
+        """Display the transcript for the currently selected row with timestamps in clean readable HTML."""
         if row_data is None:
             self._preview_title.setText("No recording selected")
             self._preview_text.clear()
-            self._preview_text.setPlaceholderText("Select a recording from the table to preview its transcript…")
+            self._preview_text.setPlaceholderText("Select a recording from the table to view its transcript…")
             self._current_preview_row_data = None
             self._copy_transcript_btn.setEnabled(False)
             self._view_full_btn.setEnabled(False)
@@ -794,69 +795,130 @@ class MainWindow(QMainWindow):
 
         self._current_preview_row_data = row_data
         name = row_data.get("name", "Unknown")
-        chosen_col = (
-            self._preview_format_combo.currentData()
-            if hasattr(self, "_preview_format_combo")
-            else "transcript_txt"
-        )
-        all_cols = (
-            "transcript_txt", "transcript_srt", "transcript_words_srt",
-            "transcript_words_csv", "transcript_vtt", "transcript_json", "transcript_csv"
-        )
-        cols_to_check = [chosen_col] + [c for c in all_cols if c != chosen_col]
+        self._preview_title.setText(str(name))
 
-        content = ""
-        found_file = False
-        loaded_col = None
-        for col_name in cols_to_check:
-            path_str = row_data.get(col_name, "")
-            if pd.isna(path_str) or not str(path_str).strip():
-                continue
-
-            path = Path(str(path_str).strip())
-            # Handle WSL paths
-            if not path.is_file() and str(path).startswith("/mnt/"):
-                import re
-                m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(path))
+        def _resolve_file(col: str) -> Optional[Path]:
+            val = row_data.get(col, "")
+            if pd.isna(val) or not str(val).strip():
+                return None
+            p = Path(str(val).strip())
+            if not p.is_file() and str(p).startswith("/mnt/"):
+                m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(p))
                 if m:
-                    path = Path(f"{m.group(1).upper()}:/{m.group(2)}")
+                    p = Path(f"{m.group(1).upper()}:/{m.group(2)}")
             ## END if WSL path...
+            return p if p.is_file() else None
 
-            if path.is_file():
+        segments: List[Tuple[float, float, str]] = []
+        found_any = False
+
+        # 1. Primary choice: transcript_json (.words.json)
+        json_file = _resolve_file("transcript_json")
+        if json_file is not None:
+            found_any = True
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8", errors="replace"))
+                for s in data.get("segments", []):
+                    txt = s.get("text", "").strip()
+                    if txt:
+                        segments.append((float(s.get("start", 0.0)), float(s.get("end", 0.0)), txt))
+                ## END for s in data.get("segments", [])...
+            except Exception:
+                segments = []
+
+        # 2. Secondary choice: transcript_srt (.srt)
+        if not segments:
+            srt_file = _resolve_file("transcript_srt")
+            if srt_file is not None:
+                found_any = True
                 try:
-                    content = path.read_text(encoding="utf-8", errors="replace")
-                    found_file = True
-                    loaded_col = col_name
-                    break
-                except OSError:
-                    continue
-            ## END if path.is_file()...
-        ## END for col_name in cols_to_check...
+                    content = srt_file.read_text(encoding="utf-8", errors="replace")
+                    blocks = re.split(r"\n\s*\n", content.strip())
+                    for block in blocks:
+                        lines = [l.strip() for l in block.splitlines() if l.strip()]
+                        for i, l in enumerate(lines):
+                            if "-->" in l:
+                                pts = l.split("-->")
+                                t_s = _parse_timestamp_to_seconds(pts[0])
+                                t_e = _parse_timestamp_to_seconds(pts[1])
+                                txt = " ".join(lines[i + 1:])
+                                if txt:
+                                    segments.append((t_s, t_e, txt))
+                                break
+                        ## END for i, l in enumerate(lines)...
+                    ## END for block in blocks...
+                except Exception:
+                    segments = []
 
-        # Apply monospace font for timestamps / code / csv formats
-        if loaded_col and loaded_col != "transcript_txt":
-            font = QFont("Cascadia Code", 10)
-            font.setStyleHint(QFont.StyleHint.Monospace)
-            self._preview_text.setFont(font)
-        else:
-            font = QFont("Segoe UI", 10)
-            self._preview_text.setFont(font)
+        # 3. Tertiary choice: transcript_vtt (.vtt)
+        if not segments:
+            vtt_file = _resolve_file("transcript_vtt")
+            if vtt_file is not None:
+                found_any = True
+                try:
+                    content = vtt_file.read_text(encoding="utf-8", errors="replace")
+                    blocks = re.split(r"\n\s*\n", content.strip())
+                    for block in blocks:
+                        lines = [l.strip() for l in block.splitlines() if l.strip()]
+                        for i, l in enumerate(lines):
+                            if "-->" in l:
+                                pts = l.split("-->")
+                                t_s = _parse_timestamp_to_seconds(pts[0])
+                                t_e = _parse_timestamp_to_seconds(pts[1])
+                                txt = " ".join(lines[i + 1:])
+                                if txt:
+                                    segments.append((t_s, t_e, txt))
+                                break
+                        ## END for i, l in enumerate(lines)...
+                    ## END for block in blocks...
+                except Exception:
+                    segments = []
 
-        self._preview_text.clear()
-        if found_file and content:
-            self._preview_text.setPlainText(content)
+        # Render timestamped segments in rich HTML
+        if segments:
+            html_parts = [
+                "<div style=\"font-family: 'Segoe UI', system-ui, sans-serif; padding: 2px;\">"
+            ]
+            for start_sec, end_sec, text in segments:
+                t_label = f"[{_format_time(start_sec)} – {_format_time(end_sec)}]"
+                escaped_text = html.escape(text)
+                html_parts.append(
+                    f"<div style=\"margin-bottom: 12px; line-height: 1.45;\">"
+                    f"<span style=\"color: #a78bfa; font-weight: 600; font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px; background-color: #282840; padding: 2px 7px; border-radius: 4px;\">{t_label}</span>"
+                    f"<div style=\"color: #e0e0ef; font-size: 13px; margin-top: 4px;\">{escaped_text}</div>"
+                    f"</div>"
+                )
+            ## END for start_sec, end_sec, text in segments...
+            html_parts.append("</div>")
+            self._preview_text.setHtml("".join(html_parts))
             self._copy_transcript_btn.setEnabled(True)
             self._view_full_btn.setEnabled(True)
-        else:
-            self._preview_text.setPlaceholderText("No transcript available for this recording.")
-            self._copy_transcript_btn.setEnabled(False)
-            self._view_full_btn.setEnabled(found_file)
+            return
 
+        # 4. Fallback if only plain text .txt is available
+        txt_file = _resolve_file("transcript_txt")
+        if txt_file is not None:
+            found_any = True
+            try:
+                plain = txt_file.read_text(encoding="utf-8", errors="replace").strip()
+                if plain:
+                    escaped_plain = html.escape(plain).replace("\n", "<br>")
+                    html_content = (
+                        f"<div style=\"font-family: 'Segoe UI', system-ui, sans-serif; padding: 2px; color: #e0e0ef; font-size: 13px; line-height: 1.5;\">"
+                        f"{escaped_plain}"
+                        f"</div>"
+                    )
+                    self._preview_text.setHtml(html_content)
+                    self._copy_transcript_btn.setEnabled(True)
+                    self._view_full_btn.setEnabled(True)
+                    return
+            except Exception:
+                pass
 
-    def _on_preview_format_changed(self) -> None:
-        """Reload preview text when user switches format in the dropdown."""
-        if self._current_preview_row_data is not None:
-            self._update_transcript_preview(self._current_preview_row_data)
+        self._preview_text.clear()
+        self._preview_text.setPlaceholderText("No transcript available for this recording.")
+        self._copy_transcript_btn.setEnabled(False)
+        self._view_full_btn.setEnabled(found_any)
 
 
     def _on_copy_preview_clicked(self) -> None:
