@@ -551,6 +551,10 @@ def process_recordings(
         if filelist_df is None or filelist_path is None:
             return
         for col, path_str in transcript_cols.items():
+            if col not in filelist_df.columns:
+                filelist_df[col] = pd.Series(dtype="object")
+            elif filelist_df[col].dtype != "object":
+                filelist_df[col] = filelist_df[col].astype("object")
             filelist_df.at[row_index, col] = path_str
         ## END for col, path_str in transcript_cols.items()....
 

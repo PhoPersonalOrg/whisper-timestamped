@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -239,6 +239,23 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self._view_full_btn)
 
         layout.addLayout(header_layout)
+
+        # Format selector row
+        format_layout = QHBoxLayout()
+        format_lbl = QLabel("Format:")
+        format_lbl.setObjectName("dimLabel")
+        format_layout.addWidget(format_lbl)
+
+        self._preview_format_combo = QComboBox()
+        self._preview_format_combo.addItem("Plain Text (.txt)", "transcript_txt")
+        self._preview_format_combo.addItem("Subtitles (.srt)", "transcript_srt")
+        self._preview_format_combo.addItem("Word Subtitles (.words.srt)", "transcript_words_srt")
+        self._preview_format_combo.addItem("Word Timestamps CSV (.words.csv)", "transcript_words_csv")
+        self._preview_format_combo.addItem("JSON Timestamps (.words.json)", "transcript_json")
+        self._preview_format_combo.addItem("WebVTT (.vtt)", "transcript_vtt")
+        self._preview_format_combo.currentIndexChanged.connect(self._on_preview_format_changed)
+        format_layout.addWidget(self._preview_format_combo, stretch=1)
+        layout.addLayout(format_layout)
 
         # Transcript text editor
         self._preview_text = QPlainTextEdit()
@@ -777,12 +794,21 @@ class MainWindow(QMainWindow):
 
         self._current_preview_row_data = row_data
         name = row_data.get("name", "Unknown")
-        self._preview_title.setText(str(name))
+        chosen_col = (
+            self._preview_format_combo.currentData()
+            if hasattr(self, "_preview_format_combo")
+            else "transcript_txt"
+        )
+        all_cols = (
+            "transcript_txt", "transcript_srt", "transcript_words_srt",
+            "transcript_words_csv", "transcript_vtt", "transcript_json", "transcript_csv"
+        )
+        cols_to_check = [chosen_col] + [c for c in all_cols if c != chosen_col]
 
-        # Look for transcript files in priority order: txt, srt, vtt, json, csv
         content = ""
         found_file = False
-        for col_name in ("transcript_txt", "transcript_srt", "transcript_vtt", "transcript_json", "transcript_csv"):
+        loaded_col = None
+        for col_name in cols_to_check:
             path_str = row_data.get(col_name, "")
             if pd.isna(path_str) or not str(path_str).strip():
                 continue
@@ -800,11 +826,21 @@ class MainWindow(QMainWindow):
                 try:
                     content = path.read_text(encoding="utf-8", errors="replace")
                     found_file = True
+                    loaded_col = col_name
                     break
                 except OSError:
                     continue
             ## END if path.is_file()...
-        ## END for col_name in ("transcript_txt", "transcript_srt", "transcript_vtt", "transcript_json", "transcript_csv")...
+        ## END for col_name in cols_to_check...
+
+        # Apply monospace font for timestamps / code / csv formats
+        if loaded_col and loaded_col != "transcript_txt":
+            font = QFont("Cascadia Code", 10)
+            font.setStyleHint(QFont.StyleHint.Monospace)
+            self._preview_text.setFont(font)
+        else:
+            font = QFont("Segoe UI", 10)
+            self._preview_text.setFont(font)
 
         self._preview_text.clear()
         if found_file and content:
@@ -815,6 +851,12 @@ class MainWindow(QMainWindow):
             self._preview_text.setPlaceholderText("No transcript available for this recording.")
             self._copy_transcript_btn.setEnabled(False)
             self._view_full_btn.setEnabled(found_file)
+
+
+    def _on_preview_format_changed(self) -> None:
+        """Reload preview text when user switches format in the dropdown."""
+        if self._current_preview_row_data is not None:
+            self._update_transcript_preview(self._current_preview_row_data)
 
 
     def _on_copy_preview_clicked(self) -> None:
