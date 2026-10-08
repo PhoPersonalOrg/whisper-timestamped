@@ -14,6 +14,7 @@ from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
