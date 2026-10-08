@@ -1,0 +1,12 @@
+"""Audio Recording Manager GUI."""
+
+import sys
+from pathlib import Path
+
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from scripts.gui.main_window import MainWindow, main
+
+__all__ = ["MainWindow", "main"]
