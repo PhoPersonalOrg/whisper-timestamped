@@ -1,9 +1,9 @@
+import argparse
+import json
 import os
 import re
 import signal
 import sys
-# import argparse
-import json
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -14,9 +14,31 @@ from whisper.utils import str2bool, optional_float, optional_int
 import whisper_timestamped as whisper
 from whisper_timestamped.transcribe import write_csv, flatten, remove_keys, get_vad_segments
 from whisper_timestamped.parse_video_filename import build_EDF_compatible_video_filename, parse_video_filename
-from whisper_timestamped.recording_formats import get_format
+from whisper_timestamped.recording_formats import get_format, list_format_ids
 # from whisper_timestamped import remove_non_speech
 from whisper_timestamped.transcribe import remove_non_speech
+
+
+DEFAULT_FORMAT = "ios_whisper_app"
+
+
+def _parse_video_extensions(value: str) -> List[str]:
+    """Comma-separated extensions → list with leading dots, lowercased."""
+    exts: List[str] = []
+    for part in value.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if not part.startswith("."):
+            part = f".{part}"
+        exts.append(part)
+    ## END for part in value.split(",")....
+    if not exts:
+        raise argparse.ArgumentTypeError(
+            "video_extensions must be a non-empty comma-separated list "
+            "(e.g. .m4a,.caf)"
+        )
+    return exts
 
 
 def _running_in_wsl() -> bool:
@@ -664,14 +686,83 @@ def process_recordings(
 
 
 if __name__ == "__main__":
-    # Switch formats here instead of commenting path blocks.
-    # Known ids: debut | rec_continuous | ios_whisper_app | just_press_record | voice_memos
-    # ACTIVE_FORMAT = "just_press_record" #TODO 2026-09-29 11:11: - [ ] WORKING WIN
-    # ACTIVE_FORMAT = "ios_whisper_app" #TODO 2026-09-29 11:12: - [ ] WORKING WIN
-    ACTIVE_FORMAT = "voice_memos" 
+    known_formats = ", ".join(list_format_ids())
+    parser = argparse.ArgumentParser(
+        description=(
+            "Batch-transcribe recordings for a selected format. "
+            "Provide at most one of --filelist or --recordings_dir; "
+            "when neither is set, uses the format's default input mode."
+        )
+    )
+    parser.add_argument(
+        "--format",
+        "-f",
+        dest="format_id",
+        default=DEFAULT_FORMAT,
+        choices=list_format_ids(),
+        help=f"Recordings format id (known: {known_formats}; default: {DEFAULT_FORMAT})",
+    )
+    parser.add_argument(
+        "--filelist",
+        type=Path,
+        default=None,
+        help="Filelist CSV path (sets filelist_csv; mutually exclusive with --recordings_dir)",
+    )
+    parser.add_argument(
+        "--recordings_dir",
+        type=Path,
+        default=None,
+        help="Directory of media to glob (mutually exclusive with --filelist)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Transcript output directory (default: format's default_output_dir)",
+    )
+    parser.add_argument(
+        "--video_extensions",
+        type=_parse_video_extensions,
+        default=None,
+        help="Comma-separated media extensions for directory mode (e.g. .m4a,.caf)",
+    )
+    args = parser.parse_args()
 
-    fmt = get_format(ACTIVE_FORMAT)
-    process_recordings_kwargs = fmt.process_recordings_kwargs()
+    if args.filelist is not None and args.recordings_dir is not None:
+        parser.error("provide at most one of --filelist and --recordings_dir")
+    ## END if both input modes....
+
+    fmt = get_format(args.format_id)
+    if args.filelist is not None:
+        process_recordings_kwargs = {
+            "filelist_csv": args.filelist,
+            "output_dir": (
+                args.output_dir
+                if args.output_dir is not None
+                else fmt.default_output_dir
+            ),
+        }
+    elif args.recordings_dir is not None:
+        process_recordings_kwargs = {
+            "recordings_dir": args.recordings_dir,
+            "output_dir": (
+                args.output_dir
+                if args.output_dir is not None
+                else fmt.default_output_dir
+            ),
+            "video_extensions": (
+                args.video_extensions
+                if args.video_extensions is not None
+                else list(fmt.media_extensions)
+            ),
+        }
+    else:
+        process_recordings_kwargs = fmt.process_recordings_kwargs(
+            output_dir=args.output_dir,
+            video_extensions=args.video_extensions,
+        )
+    ## END if filelist / recordings_dir / format defaults....
+
     print(
         f"Active recordings format: {fmt.id} ({fmt.label}) -> "
         f"{process_recordings_kwargs}"
