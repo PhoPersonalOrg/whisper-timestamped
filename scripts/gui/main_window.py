@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QDockWidget,
@@ -87,10 +88,12 @@ class MainWindow(QMainWindow):
         # Track loaded CSVs: format_id -> csv_path
         self._loaded_csvs: Dict[str, Path] = {}
         self._playing_row: int = -1
+        self._current_preview_row_data: Optional[pd.Series] = None
 
         # -- Build UI ------------------------------------------------------------
         self._build_toolbar()
         self._build_table()
+        self._build_preview_dock()
         self._build_playback_dock()
         self._build_log_dock()
         self._build_status_bar()
@@ -194,6 +197,60 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self._table)
 
+        # Selection change listener for transcript preview
+        sel_model = self._table.selectionModel()
+        if sel_model is not None:
+            sel_model.selectionChanged.connect(self._on_selection_changed)
+            sel_model.currentChanged.connect(self._on_selection_changed)
+
+
+    # ── Transcript Preview Dock (Right Side) ─────────────────────────────────
+
+    def _build_preview_dock(self) -> None:
+        dock = QDockWidget("Transcript Preview", self)
+        dock.setObjectName("transcriptPreviewDock")
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+        )
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        # Header with filename and actions
+        header_layout = QHBoxLayout()
+        self._preview_title = QLabel("No recording selected")
+        self._preview_title.setStyleSheet("font-weight: 600; font-size: 13px;")
+        self._preview_title.setWordWrap(True)
+        header_layout.addWidget(self._preview_title, stretch=1)
+
+        self._copy_transcript_btn = QPushButton("📋 Copy")
+        self._copy_transcript_btn.setToolTip("Copy transcript text to clipboard")
+        self._copy_transcript_btn.setEnabled(False)
+        self._copy_transcript_btn.clicked.connect(self._on_copy_preview_clicked)
+        header_layout.addWidget(self._copy_transcript_btn)
+
+        self._view_full_btn = QPushButton("🔍 Full View")
+        self._view_full_btn.setToolTip("Open in full tabbed transcript viewer")
+        self._view_full_btn.setEnabled(False)
+        self._view_full_btn.clicked.connect(self._on_open_full_viewer_clicked)
+        header_layout.addWidget(self._view_full_btn)
+
+        layout.addLayout(header_layout)
+
+        # Transcript text editor
+        self._preview_text = QPlainTextEdit()
+        self._preview_text.setReadOnly(True)
+        self._preview_text.setPlaceholderText("Select a recording from the table to preview its transcript…")
+        layout.addWidget(self._preview_text, stretch=1)
+
+        dock.setWidget(container)
+        dock.setMinimumWidth(320)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._preview_dock = dock
+
 
     # ── Playback Dock ────────────────────────────────────────────────────────
 
@@ -252,13 +309,6 @@ class MainWindow(QMainWindow):
         self._now_playing = QLabel("")
         self._now_playing.setObjectName("dimLabel")
         layout.addWidget(self._now_playing)
-
-        # Transcript preview
-        self._preview_text = QPlainTextEdit()
-        self._preview_text.setReadOnly(True)
-        self._preview_text.setMaximumHeight(100)
-        self._preview_text.setPlaceholderText("Transcript preview…")
-        layout.addWidget(self._preview_text)
 
         dock.setWidget(container)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
@@ -685,28 +735,102 @@ class MainWindow(QMainWindow):
         self._now_playing.setText(f"Now playing: {name}")
         self._playing_row = visual_row
 
-        # Load transcript preview
-        self._preview_text.clear()
-        txt_path = row_data.get("transcript_txt", "")
-        if pd.notna(txt_path) and str(txt_path).strip():
-            txt_file = Path(str(txt_path).strip())
-            # Handle WSL paths for transcript too
-            if not txt_file.is_file() and str(txt_file).startswith("/mnt/"):
-                import re
-                m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(txt_file))
-                if m:
-                    txt_file = Path(f"{m.group(1).upper()}:/{m.group(2)}")
-            if txt_file.is_file():
-                try:
-                    content = txt_file.read_text(encoding="utf-8", errors="replace")
-                    if len(content) > 500:
-                        content = content[:500] + "…"
-                    self._preview_text.setPlainText(content)
-                except OSError:
-                    pass
+        # Update transcript preview for the playing row
+        self._update_transcript_preview(row_data)
 
         self._player.load(audio_path)
         self._player.play()
+
+
+    def _on_selection_changed(self, *args) -> None:
+        """Update transcript preview when table row selection changes."""
+        sel_model = self._table.selectionModel()
+        if sel_model is None:
+            self._update_transcript_preview(None)
+            return
+
+        selected_rows = sel_model.selectedRows()
+        if not selected_rows:
+            self._update_transcript_preview(None)
+            return
+
+        proxy_idx = selected_rows[0]
+        source_idx = self._proxy.mapToSource(proxy_idx)
+        if not source_idx.isValid():
+            self._update_transcript_preview(None)
+            return
+
+        row_data = self._model.get_row_data(source_idx.row())
+        self._update_transcript_preview(row_data)
+
+
+    def _update_transcript_preview(self, row_data: Optional[pd.Series]) -> None:
+        """Display the transcript for the currently selected row in the preview panel."""
+        if row_data is None:
+            self._preview_title.setText("No recording selected")
+            self._preview_text.clear()
+            self._preview_text.setPlaceholderText("Select a recording from the table to preview its transcript…")
+            self._current_preview_row_data = None
+            self._copy_transcript_btn.setEnabled(False)
+            self._view_full_btn.setEnabled(False)
+            return
+
+        self._current_preview_row_data = row_data
+        name = row_data.get("name", "Unknown")
+        self._preview_title.setText(str(name))
+
+        # Look for transcript files in priority order: txt, srt, vtt, json, csv
+        content = ""
+        found_file = False
+        for col_name in ("transcript_txt", "transcript_srt", "transcript_vtt", "transcript_json", "transcript_csv"):
+            path_str = row_data.get(col_name, "")
+            if pd.isna(path_str) or not str(path_str).strip():
+                continue
+
+            path = Path(str(path_str).strip())
+            # Handle WSL paths
+            if not path.is_file() and str(path).startswith("/mnt/"):
+                import re
+                m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(path))
+                if m:
+                    path = Path(f"{m.group(1).upper()}:/{m.group(2)}")
+            ## END if WSL path...
+
+            if path.is_file():
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                    found_file = True
+                    break
+                except OSError:
+                    continue
+            ## END if path.is_file()...
+        ## END for col_name in ("transcript_txt", "transcript_srt", "transcript_vtt", "transcript_json", "transcript_csv")...
+
+        self._preview_text.clear()
+        if found_file and content:
+            self._preview_text.setPlainText(content)
+            self._copy_transcript_btn.setEnabled(True)
+            self._view_full_btn.setEnabled(True)
+        else:
+            self._preview_text.setPlaceholderText("No transcript available for this recording.")
+            self._copy_transcript_btn.setEnabled(False)
+            self._view_full_btn.setEnabled(found_file)
+
+
+    def _on_copy_preview_clicked(self) -> None:
+        """Copy the current transcript preview text to the clipboard."""
+        text = self._preview_text.toPlainText()
+        if text:
+            clipboard = QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setText(text)
+                self._status_label.setText("Transcript copied to clipboard")
+
+
+    def _on_open_full_viewer_clicked(self) -> None:
+        """Open the full tabbed transcript viewer dialog for the previewed recording."""
+        if self._current_preview_row_data is not None:
+            self._view_transcript(self._current_preview_row_data)
 
 
     def _view_transcript(self, row_data: pd.Series) -> None:

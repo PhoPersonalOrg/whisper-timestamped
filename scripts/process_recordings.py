@@ -142,11 +142,19 @@ class _GracefulInterruptState:
         self._prev_handler = None
 
     def install(self) -> None:
-        self._prev_handler = signal.signal(signal.SIGINT, self._on_sigint)
+        try:
+            self._prev_handler = signal.signal(signal.SIGINT, self._on_sigint)
+        except (ValueError, AttributeError):
+            # Not in main thread of main interpreter (e.g. GUI worker thread)
+            self._prev_handler = None
+
 
     def restore(self) -> None:
         if self._prev_handler is not None:
-            signal.signal(signal.SIGINT, self._prev_handler)
+            try:
+                signal.signal(signal.SIGINT, self._prev_handler)
+            except (ValueError, AttributeError):
+                pass
             self._prev_handler = None
 
     def _on_sigint(self, signum, frame) -> None:
