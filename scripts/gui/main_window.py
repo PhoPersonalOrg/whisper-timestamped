@@ -398,6 +398,23 @@ class MainWindow(QMainWindow):
             self._format_combo.setCurrentIndex(idx)
         self._format_combo.blockSignals(False)
 
+        self._auto_size_columns()
+        QTimer.singleShot(0, self._auto_size_columns)
+
+
+    def _auto_size_columns(self) -> None:
+        """Auto-size table columns to fit both header names and cell contents."""
+        self._table.resizeColumnsToContents()
+        header = self._table.horizontalHeader()
+        if header is not None:
+            if header.sectionSize(0) < 36:
+                header.resizeSection(0, 36)
+            for col in range(1, self._model.columnCount()):
+                new_width = max(header.sectionSize(col) + 20, 60)
+                header.resizeSection(col, new_width)
+            ## END for col in range(1, self._model.columnCount())...
+
+
 
     # -- Transcription ---------------------------------------------------------
 
@@ -529,6 +546,7 @@ class MainWindow(QMainWindow):
             f"\n✓ Done — {completed} completed, {failed} failed"
         )
         self._update_status_bar()
+        self._auto_size_columns()
 
 
     def _on_transcription_error(self, msg: str) -> None:
