@@ -43,3 +43,11 @@ uv run python scripts/process_recordings.py \
 | `--video_extensions` | Comma-separated extensions for directory mode, e.g. `.m4a,.caf` (default: format’s `media_extensions`) |
 
 Provide **at most one** of `--filelist` or `--recordings_dir`. When neither is set, the format’s default input mode is used (filelist formats pick the newest matching CSV by mtime).
+
+## Running via GUI:
+
+```bash
+
+uv run python .\scripts\gui
+
+```

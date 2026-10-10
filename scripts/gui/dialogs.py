@@ -32,7 +32,15 @@ from whisper_timestamped.recording_formats import (
 class ScanConfigDialog(QDialog):
     """Pre-scan configuration: audio dir, format, timezone, CSV output path."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        initial_audio_dir: str = "",
+        initial_format_id: str = "",
+        initial_timezone: Optional[str] = None,
+        initial_csv_path: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Scan Audio Directory")
         self.setMinimumWidth(550)
@@ -43,7 +51,7 @@ class ScanConfigDialog(QDialog):
 
         # Audio directory
         dir_row = QHBoxLayout()
-        self._dir_edit = QLineEdit()
+        self._dir_edit = QLineEdit(initial_audio_dir or "")
         self._dir_edit.setPlaceholderText("Select audio directory…")
         dir_row.addWidget(self._dir_edit, stretch=1)
         browse_btn = QPushButton("Browse…")
@@ -59,15 +67,19 @@ class ScanConfigDialog(QDialog):
             self._format_combo.addItem(f"{fid} — {fmt.label}", fid)
         ## END for fid in list_format_ids()...
         self._format_combo.currentIndexChanged.connect(self._on_format_changed)
+        if initial_format_id:
+            idx = self._format_combo.findData(initial_format_id)
+            if idx >= 0:
+                self._format_combo.setCurrentIndex(idx)
         form.addRow("Format:", self._format_combo)
 
         # Timezone
-        self._tz_edit = QLineEdit("America/Los_Angeles")
+        self._tz_edit = QLineEdit(initial_timezone or "America/Los_Angeles")
         form.addRow("Timezone:", self._tz_edit)
 
         # Output CSV
         csv_row = QHBoxLayout()
-        self._csv_edit = QLineEdit()
+        self._csv_edit = QLineEdit(initial_csv_path or "")
         self._csv_edit.setPlaceholderText("Auto-generated from format defaults")
         csv_row.addWidget(self._csv_edit, stretch=1)
         csv_browse = QPushButton("Browse…")
@@ -131,8 +143,13 @@ class ScanConfigDialog(QDialog):
         return Path(self._dir_edit.text().strip())
 
 
+    def format_id(self) -> str:
+        """Raw combo value; empty string means Auto-detect."""
+        return self._format_combo.currentData() or ""
+
+
     def selected_format(self) -> Optional[RecordingsFormat]:
-        fid = self._format_combo.currentData()
+        fid = self.format_id()
         if not fid:
             # Auto-detect from the selected directory
             audio_dir = self.audio_dir()

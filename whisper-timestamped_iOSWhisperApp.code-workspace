@@ -10,10 +10,27 @@
 			"path": "../CrisperWhisper"
 		}
 	],
-	"settings": {},
+	"settings": {
+		"actionButtons": {
+
+			"commands": [
+            {
+                "name": "Launch Recording Transcriber GUI",
+				"tooltip": "Launch Recording Transcriber GUI",
+                "color": "#ed9600",
+                "useVsCodeApi": false,
+                "command": "uv run python scripts/gui"
+            },
+			],
+			"defaultColor": "white",
+			"reloadButton": "↻",
+			"loadNpmCommands": false
+		}
+	},
 	"extensions": {
 		"recommendations": [
 			"repreng.csv"
-		]
+		],
+
 	}
 }

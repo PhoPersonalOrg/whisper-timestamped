@@ -1,8 +1,7 @@
-"""Transcript viewer dialog — tabbed view of transcription output files."""
+"""Transcript viewer dialog — readable view plus tabbed raw output files."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
@@ -16,7 +15,16 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
+)
+
+from scripts.gui.transcript_format import (
+    TranscriptDoc,
+    load_transcript,
+    render_html,
+    render_plain,
+    resolve_path,
 )
 
 
@@ -42,6 +50,9 @@ class TranscriptViewerDialog(QDialog):
         self.setMinimumSize(700, 500)
         self.resize(900, 650)
 
+        self._doc: Optional[TranscriptDoc] = load_transcript(row_data)
+        self._readable_editor: Optional[QTextEdit] = None
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -55,24 +66,24 @@ class TranscriptViewerDialog(QDialog):
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs, stretch=1)
 
-        # Populate tabs for each transcript file that exists
-        self._editors: Dict[str, QPlainTextEdit] = {}
         found_any = False
+
+        # Readable tab first (structured HTML from .words.json / fallbacks)
+        if self._doc is not None:
+            found_any = True
+            readable = QTextEdit()
+            readable.setReadOnly(True)
+            readable.setFont(QFont("Segoe UI", 11))
+            readable.setHtml(render_html(self._doc, include_words=True))
+            self._readable_editor = readable
+            self._tabs.addTab(readable, "Readable")
+        ## END if self._doc is not None....
+
+        # Populate tabs for each raw transcript file that exists
+        self._editors: Dict[str, QPlainTextEdit] = {}
         for col_name, tab_label, mono in _TAB_SPECS:
-            path_str = row_data.get(col_name, "")
-            if pd.isna(path_str) or not str(path_str).strip():
-                continue
-
-            path = Path(str(path_str).strip())
-            # Handle WSL paths — try as-is first, then convert /mnt/X/ → X:/
-            if not path.is_file() and str(path).startswith("/mnt/"):
-                import re
-                m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(path))
-                if m:
-                    path = Path(f"{m.group(1).upper()}:/{m.group(2)}")
-            ## END if WSL path conversion...
-
-            if not path.is_file():
+            path = resolve_path(row_data, col_name)
+            if path is None:
                 continue
 
             found_any = True
@@ -84,25 +95,30 @@ class TranscriptViewerDialog(QDialog):
                 editor.setFont(font)
             else:
                 editor.setFont(QFont("Segoe UI", 11))
+            ## END if mono....
 
             # Load content (limit very large files to first 500KB)
             try:
                 content = path.read_text(encoding="utf-8", errors="replace")
                 if len(content) > 512_000:
                     content = content[:512_000] + "\n\n… [truncated — file exceeds 500 KB]"
+                ## END if len(content) > 512_000....
+
                 editor.setPlainText(content)
             except OSError as exc:
                 editor.setPlainText(f"Error reading {path.name}: {exc}")
+            ## END try read path....
 
             self._editors[col_name] = editor
             self._tabs.addTab(editor, tab_label)
-        ## END for col_name, tab_label, mono in _TAB_SPECS...
+        ## END for col_name, tab_label, mono in _TAB_SPECS....
 
         if not found_any:
             placeholder = QPlainTextEdit()
             placeholder.setReadOnly(True)
             placeholder.setPlainText("No transcript files found for this recording.")
             self._tabs.addTab(placeholder, "—")
+        ## END if not found_any....
 
         # Bottom buttons
         btn_layout = QHBoxLayout()
@@ -122,8 +138,18 @@ class TranscriptViewerDialog(QDialog):
     def _copy_current(self) -> None:
         """Copy the current tab's text to the clipboard."""
         widget = self._tabs.currentWidget()
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        ## END if clipboard is None....
+
+        if widget is self._readable_editor and self._doc is not None:
+            clipboard.setText(render_plain(self._doc, include_words=True))
+            return
+        ## END if readable tab....
+
         if isinstance(widget, QPlainTextEdit):
-            text = widget.toPlainText()
-            clipboard = QApplication.clipboard()
-            if clipboard is not None:
-                clipboard.setText(text)
+            clipboard.setText(widget.toPlainText())
+        elif isinstance(widget, QTextEdit):
+            clipboard.setText(widget.toPlainText())
+        ## END if widget type....

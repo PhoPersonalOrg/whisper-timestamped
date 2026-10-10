@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import html
-import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 from PyQt6.QtCore import Qt, QTimer
@@ -47,12 +45,20 @@ if _REPO_ROOT not in sys.path:
 
 from scripts.gui.audio_player import AudioPlayer
 from scripts.gui.dialogs import ScanConfigDialog, TranscribeConfigDialog
+from scripts.gui.preferences import load_prefs, save_prefs
 from scripts.gui.scan_worker import ScanWorker
 from scripts.gui.table_model import (
     RecordingFilterProxy,
     RecordingTableModel,
     load_format_csv,
     merge_format_csvs,
+)
+from scripts.gui.transcript_format import (
+    TranscriptDoc,
+    has_any_transcript,
+    load_transcript,
+    render_html,
+    render_plain,
 )
 from scripts.gui.transcript_viewer import TranscriptViewerDialog
 from scripts.gui.transcribe_worker import TranscribeWorker
@@ -63,7 +69,7 @@ from scripts.iOSWhisperAppHelpers.extract_m4a_creation_times import (
 
 
 def _format_time(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
+    """Format seconds as HH:MM:SS for the playback scrubber."""
     total = int(seconds)
     h = total // 3600
     m = (total % 3600) // 60
@@ -71,20 +77,6 @@ def _format_time(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
-
-
-def _parse_timestamp_to_seconds(ts_str: str) -> float:
-    """Parse '00:01:23,456' or '01:23.456' to float seconds."""
-    s = ts_str.replace(",", ".").strip()
-    parts = s.split(":")
-    try:
-        if len(parts) == 3:
-            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-        if len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-        return float(s)
-    except (ValueError, IndexError):
-        return 0.0
 
 
 class MainWindow(QMainWindow):
@@ -105,8 +97,10 @@ class MainWindow(QMainWindow):
         self._transcribe_worker: Optional[TranscribeWorker] = None
         # Track loaded CSVs: format_id -> csv_path
         self._loaded_csvs: Dict[str, Path] = {}
+        self._prefs = load_prefs()
         self._playing_row: int = -1
         self._current_preview_row_data: Optional[pd.Series] = None
+        self._current_preview_doc: Optional[TranscriptDoc] = None
 
         # -- Build UI ------------------------------------------------------------
         self._build_toolbar()
@@ -116,11 +110,7 @@ class MainWindow(QMainWindow):
         self._build_log_dock()
         self._build_status_bar()
         self._connect_signals()
-
-        # Show a welcome hint in the status bar
-        self._status_label.setText(
-            "Ready — use Scan Audio Dir or Load CSV to get started"
-        )
+        self._restore_prefs()
 
 
     # ── Toolbar ──────────────────────────────────────────────────────────────
@@ -371,10 +361,38 @@ class MainWindow(QMainWindow):
         self._player.error.connect(self._on_player_error)
 
 
+    # ── Preferences ──────────────────────────────────────────────────────────
+
+    def _restore_prefs(self) -> None:
+        """Apply persisted paths: reload last filelists into the table."""
+        loaded = self._prefs.get("loaded_csvs") or {}
+        self._loaded_csvs = dict(loaded)
+        if self._loaded_csvs:
+            self._reload_merged_data()
+            names = ", ".join(p.name for p in self._loaded_csvs.values())
+            self._status_label.setText(f"Restored {names}")
+        else:
+            self._status_label.setText(
+                "Ready — use Scan Audio Dir or Load CSV to get started"
+            )
+
+
+    def _save_prefs(self) -> None:
+        """Persist current path/filelist preferences."""
+        self._prefs["loaded_csvs"] = dict(self._loaded_csvs)
+        save_prefs(self._prefs)
+
+
     # ── Toolbar Actions ──────────────────────────────────────────────────────
 
     def _on_scan_clicked(self) -> None:
-        dlg = ScanConfigDialog(self)
+        dlg = ScanConfigDialog(
+            self,
+            initial_audio_dir=self._prefs.get("scan_audio_dir", ""),
+            initial_format_id=self._prefs.get("scan_format_id", ""),
+            initial_timezone=self._prefs.get("scan_timezone") or None,
+            initial_csv_path=self._prefs.get("scan_csv_path", ""),
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -394,6 +412,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Format", "Could not determine format.")
             return
 
+        self._prefs["scan_audio_dir"] = str(audio_dir)
+        self._prefs["scan_format_id"] = dlg.format_id()
+        self._prefs["scan_timezone"] = tz
+        self._prefs["scan_csv_path"] = str(csv_path)
+        self._save_prefs()
+
         self._status_label.setText(f"Scanning {audio_dir.name}…")
         self._scan_worker = ScanWorker(audio_dir, fmt, tz, csv_path, parent=self)
         self._scan_worker.progress.connect(
@@ -407,6 +431,8 @@ class MainWindow(QMainWindow):
     def _on_scan_finished(self, format_id: str, csv_path: object) -> None:
         csv_path = Path(str(csv_path))
         self._loaded_csvs[format_id] = csv_path
+        self._prefs["scan_csv_path"] = str(csv_path)
+        self._save_prefs()
         self._reload_merged_data()
         self._status_label.setText(f"Scan complete — loaded {csv_path.name}")
 
@@ -417,8 +443,12 @@ class MainWindow(QMainWindow):
 
 
     def _on_load_csv_clicked(self) -> None:
+        start_dir = self._prefs.get("browse_load_csv_dir", "") or ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Filelist CSV", "", "CSV files (*.csv);;All files (*)",
+            self,
+            "Load Filelist CSV",
+            start_dir,
+            "CSV files (*.csv);;All files (*)",
         )
         if not path:
             return
@@ -428,6 +458,8 @@ class MainWindow(QMainWindow):
         format_id = self._infer_format_id(csv_path)
 
         self._loaded_csvs[format_id] = csv_path
+        self._prefs["browse_load_csv_dir"] = str(csv_path.parent)
+        self._save_prefs()
         self._reload_merged_data()
         self._status_label.setText(f"Loaded {csv_path.name} as {format_id}")
 
@@ -554,7 +586,8 @@ class MainWindow(QMainWindow):
             else:
                 default_out = csv_path.parent / "transcriptions"
         else:
-            default_out = Path("transcriptions")
+            saved_out = self._prefs.get("transcribe_output_dir", "") or ""
+            default_out = Path(saved_out) if saved_out else Path("transcriptions")
 
         # Show config dialog
         dlg = TranscribeConfigDialog(str(default_out), parent=self)
@@ -563,6 +596,8 @@ class MainWindow(QMainWindow):
 
         output_dir = dlg.output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
+        self._prefs["transcribe_output_dir"] = str(output_dir)
+        self._save_prefs()
 
         # Show log dock
         self._log_dock.show()
@@ -602,6 +637,21 @@ class MainWindow(QMainWindow):
         self._model.update_row(df_index, transcript_cols)
         # Also update the backing CSV
         self._save_affected_csv(df_index)
+        # Refresh preview if this row is currently selected
+        selection = self._table.selectionModel()
+        if selection is not None and selection.hasSelection():
+            proxy_index = selection.currentIndex()
+            if proxy_index.isValid():
+                source_index = self._proxy.mapToSource(proxy_index)
+                if source_index.isValid() and source_index.row() == df_index:
+                    row_data = self._model.get_row_data(source_index.row())
+                    if row_data is not None:
+                        self._update_transcript_preview(row_data)
+                    ## END if row_data is not None....
+                ## END if source_index matches transcribed row....
+            ## END if proxy_index.isValid()....
+        ## END if selection hasSelection....
+
 
 
     def _on_transcription_done(self, completed: int, failed: int) -> None:
@@ -692,11 +742,9 @@ class MainWindow(QMainWindow):
             lambda: self._play_row(row_data, source_index.row())
         )
 
-        # View transcript (only if transcribed)
-        txt_path = row_data.get("transcript_txt", "")
-        has_transcript = pd.notna(txt_path) and str(txt_path).strip()
+        # View transcript (only if any transcript_* path is set)
         view_action = menu.addAction("📄 View Transcript")
-        view_action.setEnabled(bool(has_transcript))
+        view_action.setEnabled(has_any_transcript(row_data))
         view_action.triggered.connect(lambda: self._view_transcript(row_data))
 
         menu.addSeparator()
@@ -787,8 +835,11 @@ class MainWindow(QMainWindow):
         if row_data is None:
             self._preview_title.setText("No recording selected")
             self._preview_text.clear()
-            self._preview_text.setPlaceholderText("Select a recording from the table to view its transcript…")
+            self._preview_text.setPlaceholderText(
+                "Select a recording from the table to view its transcript…"
+            )
             self._current_preview_row_data = None
+            self._current_preview_doc = None
             self._copy_transcript_btn.setEnabled(False)
             self._view_full_btn.setEnabled(False)
             return
@@ -797,138 +848,37 @@ class MainWindow(QMainWindow):
         name = row_data.get("name", "Unknown")
         self._preview_title.setText(str(name))
 
-        def _resolve_file(col: str) -> Optional[Path]:
-            val = row_data.get(col, "")
-            if pd.isna(val) or not str(val).strip():
-                return None
-            p = Path(str(val).strip())
-            if not p.is_file() and str(p).startswith("/mnt/"):
-                m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(p))
-                if m:
-                    p = Path(f"{m.group(1).upper()}:/{m.group(2)}")
-            ## END if WSL path...
-            return p if p.is_file() else None
-
-        segments: List[Tuple[float, float, str]] = []
-        found_any = False
-
-        # 1. Primary choice: transcript_json (.words.json)
-        json_file = _resolve_file("transcript_json")
-        if json_file is not None:
-            found_any = True
-            try:
-                data = json.loads(json_file.read_text(encoding="utf-8", errors="replace"))
-                for s in data.get("segments", []):
-                    txt = s.get("text", "").strip()
-                    if txt:
-                        segments.append((float(s.get("start", 0.0)), float(s.get("end", 0.0)), txt))
-                ## END for s in data.get("segments", [])...
-            except Exception:
-                segments = []
-
-        # 2. Secondary choice: transcript_srt (.srt)
-        if not segments:
-            srt_file = _resolve_file("transcript_srt")
-            if srt_file is not None:
-                found_any = True
-                try:
-                    content = srt_file.read_text(encoding="utf-8", errors="replace")
-                    blocks = re.split(r"\n\s*\n", content.strip())
-                    for block in blocks:
-                        lines = [l.strip() for l in block.splitlines() if l.strip()]
-                        for i, l in enumerate(lines):
-                            if "-->" in l:
-                                pts = l.split("-->")
-                                t_s = _parse_timestamp_to_seconds(pts[0])
-                                t_e = _parse_timestamp_to_seconds(pts[1])
-                                txt = " ".join(lines[i + 1:])
-                                if txt:
-                                    segments.append((t_s, t_e, txt))
-                                break
-                        ## END for i, l in enumerate(lines)...
-                    ## END for block in blocks...
-                except Exception:
-                    segments = []
-
-        # 3. Tertiary choice: transcript_vtt (.vtt)
-        if not segments:
-            vtt_file = _resolve_file("transcript_vtt")
-            if vtt_file is not None:
-                found_any = True
-                try:
-                    content = vtt_file.read_text(encoding="utf-8", errors="replace")
-                    blocks = re.split(r"\n\s*\n", content.strip())
-                    for block in blocks:
-                        lines = [l.strip() for l in block.splitlines() if l.strip()]
-                        for i, l in enumerate(lines):
-                            if "-->" in l:
-                                pts = l.split("-->")
-                                t_s = _parse_timestamp_to_seconds(pts[0])
-                                t_e = _parse_timestamp_to_seconds(pts[1])
-                                txt = " ".join(lines[i + 1:])
-                                if txt:
-                                    segments.append((t_s, t_e, txt))
-                                break
-                        ## END for i, l in enumerate(lines)...
-                    ## END for block in blocks...
-                except Exception:
-                    segments = []
-
-        # Render timestamped segments in rich HTML
-        if segments:
-            html_parts = [
-                "<div style=\"font-family: 'Segoe UI', system-ui, sans-serif; padding: 2px;\">"
-            ]
-            for start_sec, end_sec, text in segments:
-                t_label = f"[{_format_time(start_sec)} – {_format_time(end_sec)}]"
-                escaped_text = html.escape(text)
-                html_parts.append(
-                    f"<div style=\"margin-bottom: 12px; line-height: 1.45;\">"
-                    f"<span style=\"color: #a78bfa; font-weight: 600; font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px; background-color: #282840; padding: 2px 7px; border-radius: 4px;\">{t_label}</span>"
-                    f"<div style=\"color: #e0e0ef; font-size: 13px; margin-top: 4px;\">{escaped_text}</div>"
-                    f"</div>"
-                )
-            ## END for start_sec, end_sec, text in segments...
-            html_parts.append("</div>")
-            self._preview_text.setHtml("".join(html_parts))
+        doc = load_transcript(row_data)
+        self._current_preview_doc = doc
+        if doc is not None:
+            self._preview_text.setHtml(render_html(doc, include_words=False))
             self._copy_transcript_btn.setEnabled(True)
             self._view_full_btn.setEnabled(True)
             return
-
-        # 4. Fallback if only plain text .txt is available
-        txt_file = _resolve_file("transcript_txt")
-        if txt_file is not None:
-            found_any = True
-            try:
-                plain = txt_file.read_text(encoding="utf-8", errors="replace").strip()
-                if plain:
-                    escaped_plain = html.escape(plain).replace("\n", "<br>")
-                    html_content = (
-                        f"<div style=\"font-family: 'Segoe UI', system-ui, sans-serif; padding: 2px; color: #e0e0ef; font-size: 13px; line-height: 1.5;\">"
-                        f"{escaped_plain}"
-                        f"</div>"
-                    )
-                    self._preview_text.setHtml(html_content)
-                    self._copy_transcript_btn.setEnabled(True)
-                    self._view_full_btn.setEnabled(True)
-                    return
-            except Exception:
-                pass
+        ## END if doc is not None....
 
         self._preview_text.clear()
         self._preview_text.setPlaceholderText("No transcript available for this recording.")
         self._copy_transcript_btn.setEnabled(False)
-        self._view_full_btn.setEnabled(found_any)
+        self._view_full_btn.setEnabled(has_any_transcript(row_data))
 
 
     def _on_copy_preview_clicked(self) -> None:
         """Copy the current transcript preview text to the clipboard."""
-        text = self._preview_text.toPlainText()
+        if self._current_preview_doc is not None:
+            text = render_plain(self._current_preview_doc, include_words=False)
+        else:
+            text = self._preview_text.toPlainText()
+        ## END if self._current_preview_doc is not None....
+
         if text:
             clipboard = QApplication.clipboard()
             if clipboard is not None:
                 clipboard.setText(text)
                 self._status_label.setText("Transcript copied to clipboard")
+            ## END if clipboard is not None....
+        ## END if text....
+
 
 
     def _on_open_full_viewer_clicked(self) -> None:
@@ -1076,6 +1026,7 @@ class MainWindow(QMainWindow):
     # -- Cleanup ---------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
+        self._save_prefs()
         self._player.cleanup()
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self._scan_worker.quit()
@@ -1092,6 +1043,8 @@ def main() -> None:
     from scripts.gui.style import apply_dark_theme
 
     app = QApplication(sys.argv)
+    app.setOrganizationName("whisper-timestamped")
+    app.setApplicationName("AudioRecordingManager")
     apply_dark_theme(app)
     window = MainWindow()
     window.show()
