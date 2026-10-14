@@ -6,8 +6,9 @@ import html
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -65,6 +66,7 @@ class TranscriptDoc:
     source: str = ""  # e.g. "json", "srt", "vtt", "txt"
     plain_only: bool = False  # True when only untimed plain text is available
     plain_text: str = ""
+    recording_start: Optional[datetime] = None
 
 
 def resolve_path(row: Any, col: str) -> Optional[Path]:
@@ -96,7 +98,7 @@ def has_any_transcript(row: Any) -> bool:
 
 
 def format_timestamp(seconds: float) -> str:
-    """Format seconds with centisecond precision (hours only when needed)."""
+    """Format relative seconds with centisecond precision (hours only when needed)."""
     if seconds < 0:
         seconds = 0.0
     total_cs = int(round(seconds * 100))
@@ -109,6 +111,68 @@ def format_timestamp(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
     return f"{m:02d}:{s:02d}.{cs:02d}"
+
+
+def parse_recording_datetime(row: Any) -> Optional[datetime]:
+    """Prefer extracted_creation_time, then filesystem creation_time."""
+    for col in ("extracted_creation_time", "creation_time"):
+        val = row.get(col, "") if hasattr(row, "get") else ""
+        if pd.isna(val) or not str(val).strip():
+            continue
+        try:
+            parsed = pd.to_datetime(val, errors="coerce")
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(parsed):
+            continue
+        dt = parsed.to_pydatetime()
+        if getattr(dt, "tzinfo", None) is not None:
+            dt = dt.replace(tzinfo=None)
+        ## END if tzinfo....
+
+        return dt
+    ## END for col in extracted/creation....
+
+    return None
+
+
+def _absolute_at(recording_start: datetime, offset_seconds: float) -> datetime:
+    if offset_seconds < 0:
+        offset_seconds = 0.0
+    return recording_start + timedelta(seconds=float(offset_seconds))
+
+
+def format_clock_time(dt: datetime, *, with_seconds: bool = True) -> str:
+    """iMessage-like clock: '6:48:35 PM' or '6:48 PM'."""
+    if with_seconds:
+        return dt.strftime("%I:%M:%S %p").lstrip("0")
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def format_day_header(dt: datetime) -> str:
+    """Centered day label, e.g. 'Mon, Sep 29, 2026'."""
+    return dt.strftime("%a, %b %d, %Y").replace(" 0", " ")
+
+
+def format_started_at(dt: datetime) -> str:
+    return f"Started {format_day_header(dt)} · {format_clock_time(dt)}"
+
+
+def format_segment_time(
+    offset_seconds: float,
+    recording_start: Optional[datetime],
+    *,
+    with_seconds: bool = True,
+) -> str:
+    """Absolute clock when recording_start is known; else relative duration."""
+    if recording_start is not None:
+        return format_clock_time(
+            _absolute_at(recording_start, offset_seconds),
+            with_seconds=with_seconds,
+        )
+    ## END if recording_start is not None....
+
+    return format_timestamp(offset_seconds)
 
 
 def parse_timestamp_to_seconds(ts_str: str) -> float:
@@ -307,6 +371,13 @@ def _timed_candidates(row: Any) -> List[Path]:
     return ordered
 
 
+def _attach_recording_start(doc: Optional[TranscriptDoc], row: Any) -> Optional[TranscriptDoc]:
+    if doc is None:
+        return None
+    doc.recording_start = parse_recording_datetime(row)
+    return doc
+
+
 def load_transcript(row: Any) -> Optional[TranscriptDoc]:
     """Load a TranscriptDoc: JSON → SRT → VTT (incl. siblings) → TXT."""
     for path in _timed_candidates(row):
@@ -314,28 +385,28 @@ def load_transcript(row: Any) -> Optional[TranscriptDoc]:
         if name.endswith(".words.json") or name.endswith(".json"):
             doc = _load_from_json(path)
             if doc is not None and doc.segments:
-                return doc
+                return _attach_recording_start(doc, row)
             continue
         ## END if json....
 
         if name.endswith(".srt"):
             doc = _load_from_srt(path)
             if doc is not None and doc.segments:
-                return doc
+                return _attach_recording_start(doc, row)
             continue
         ## END if srt....
 
         if name.endswith(".vtt"):
             doc = _load_from_vtt(path)
             if doc is not None and doc.segments:
-                return doc
+                return _attach_recording_start(doc, row)
             continue
         ## END if vtt....
     ## END for path in _timed_candidates(row)....
 
     txt_path = resolve_path(row, "transcript_txt")
     if txt_path is not None:
-        return _load_from_txt(txt_path)
+        return _attach_recording_start(_load_from_txt(txt_path), row)
     ## END if txt_path is not None....
 
     # Last resort: sibling .txt next to any other transcript path
@@ -343,101 +414,146 @@ def load_transcript(row: Any) -> Optional[TranscriptDoc]:
         base = _base_name_from_transcript_file(known)
         sib = _sibling_path(known, base, ".txt")
         if sib is not None:
-            return _load_from_txt(sib)
+            return _attach_recording_start(_load_from_txt(sib), row)
         ## END if sib is not None....
     ## END for known in _iter_resolved_transcript_paths(row)....
 
     return None
 
 
-def _header_bits(doc: TranscriptDoc) -> List[str]:
-    bits: List[str] = []
-    if doc.language:
-        bits.append(f"Language: {doc.language}")
-    if doc.plain_only:
-        return bits
-    n = len(doc.segments)
-    if n:
-        bits.append(f"{n} segment{'s' if n != 1 else ''}")
-        span_start = doc.segments[0].start
-        span_end = max(s.end for s in doc.segments)
-        bits.append(f"{format_timestamp(span_start)} – {format_timestamp(span_end)}")
-    ## END if n....
+def _day_key(dt: datetime) -> Tuple[int, int, int]:
+    return (dt.year, dt.month, dt.day)
 
-    return bits
+
+def _chat_header_lines(doc: TranscriptDoc) -> List[str]:
+    """Plain header lines for the top of the transcript."""
+    lines: List[str] = []
+    if doc.recording_start is not None:
+        lines.append(format_started_at(doc.recording_start))
+    ## END if doc.recording_start....
+
+    meta: List[str] = []
+    if doc.language:
+        meta.append(doc.language)
+    ## END if doc.language....
+
+    if not doc.plain_only and doc.segments:
+        meta.append(f"{len(doc.segments)} messages")
+        if doc.recording_start is not None:
+            end_dt = _absolute_at(
+                doc.recording_start, max(s.end for s in doc.segments)
+            )
+            meta.append(f"until {format_clock_time(end_dt)}")
+        else:
+            span_start = doc.segments[0].start
+            span_end = max(s.end for s in doc.segments)
+            meta.append(
+                f"{format_timestamp(span_start)} – {format_timestamp(span_end)}"
+            )
+        ## END if doc.recording_start....
+    ## END if segments....
+
+    if meta:
+        lines.append(" · ".join(meta))
+    ## END if meta....
+
+    return lines
+
+
+def _bubble_html(text: str, *, pre_escaped: bool = False) -> str:
+    """Left-leaning chat bubble (QTextDocument-friendly markup)."""
+    body = text if pre_escaped else html.escape(text)
+    return (
+        "<table width=\"100%\" cellspacing=\"0\" cellpadding=\"0\">"
+        "<tr><td width=\"4\"></td><td>"
+        "<div style=\"background-color: #3a3a5c; color: #e0e0ef; "
+        "font-size: 13px; line-height: 1.45; padding: 10px 14px; "
+        f"border-radius: 16px;\">{body}</div>"
+        "</td><td width=\"18%\"></td></tr></table>"
+    )
 
 
 def render_html(doc: TranscriptDoc, *, include_words: bool = False) -> str:
-    """Render a human-readable HTML transcript for QTextEdit.setHtml."""
-    base = (
-        "<div style=\"font-family: 'Segoe UI', system-ui, sans-serif; padding: 2px;\">"
-    )
-    parts: List[str] = [base]
+    """Render an iMessage-like chat log HTML transcript for QTextEdit.setHtml."""
+    parts: List[str] = [
+        "<div style=\"font-family: 'Segoe UI', system-ui, sans-serif; "
+        "padding: 8px 4px;\">"
+    ]
 
-    header = _header_bits(doc)
-    if header:
+    # Top: recording datetime + meta (centered, like a chat date stamp)
+    header_lines = _chat_header_lines(doc)
+    if header_lines:
         parts.append(
-            "<div style=\"color: #9898b0; font-size: 12px; margin-bottom: 14px;\">"
-            + " · ".join(html.escape(b) for b in header)
-            + "</div>"
+            "<p align=\"center\" style=\"color: #c8c8dc; font-size: 13px; "
+            f"font-weight: 600; margin: 4px 0 2px 0;\">"
+            f"{html.escape(header_lines[0])}</p>"
         )
-    ## END if header....
+        if len(header_lines) > 1:
+            parts.append(
+                "<p align=\"center\" style=\"color: #6e6e88; font-size: 11px; "
+                f"margin: 0 0 16px 0;\">{html.escape(header_lines[1])}</p>"
+            )
+        else:
+            parts.append("<div style=\"margin-bottom: 16px;\"></div>")
+        ## END if len(header_lines) > 1....
+    ## END if header_lines....
 
     if doc.plain_only:
         escaped = html.escape(doc.plain_text).replace("\n", "<br>")
-        parts.append(
-            f"<div style=\"color: #e0e0ef; font-size: 13px; line-height: 1.5;\">"
-            f"{escaped}</div></div>"
-        )
+        parts.append(_bubble_html(escaped, pre_escaped=True))
+        parts.append("</div>")
         return "".join(parts)
     ## END if doc.plain_only....
 
-    for seg in doc.segments:
-        t_label = f"[{format_timestamp(seg.start)} – {format_timestamp(seg.end)}]"
-        conf_label = _confidence_pct(seg.confidence)
-        badge = (
-            f"<span style=\"color: #a78bfa; font-weight: 600; "
-            f"font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px; "
-            f"background-color: #282840; padding: 2px 7px; border-radius: 4px;\">"
-            f"{html.escape(t_label)}</span>"
-        )
-        conf_html = ""
-        if conf_label:
-            conf_html = (
-                f"<span style=\"color: #9898b0; font-size: 11px; margin-left: 8px;\">"
-                f"{html.escape(conf_label)}</span>"
-            )
-        ## END if conf_label....
+    last_day: Optional[Tuple[int, int, int]] = None
+    if doc.recording_start is not None:
+        last_day = _day_key(doc.recording_start)
+    ## END if doc.recording_start....
 
+    for seg in doc.segments:
+        # Day separator when the absolute clock crosses midnight
+        if doc.recording_start is not None:
+            seg_dt = _absolute_at(doc.recording_start, seg.start)
+            day = _day_key(seg_dt)
+            if last_day is not None and day != last_day:
+                parts.append(
+                    "<p align=\"center\" style=\"color: #9898b0; font-size: 11px; "
+                    "font-weight: 600; margin: 18px 0 10px 0;\">"
+                    f"{html.escape(format_day_header(seg_dt))}</p>"
+                )
+            ## END if day changed....
+
+            last_day = day
+        ## END if doc.recording_start....
+
+        time_label = format_segment_time(seg.start, doc.recording_start)
+        conf_label = _confidence_pct(seg.confidence)
+        time_extra = f" · {conf_label}" if conf_label else ""
         parts.append(
-            f"<div style=\"margin-bottom: 12px; line-height: 1.45;\">"
-            f"{badge}{conf_html}"
-            f"<div style=\"color: #e0e0ef; font-size: 13px; margin-top: 4px;\">"
-            f"{html.escape(seg.text)}</div>"
+            "<p align=\"center\" style=\"color: #6e6e88; font-size: 11px; "
+            f"margin: 12px 0 4px 0;\">{html.escape(time_label + time_extra)}</p>"
         )
+        parts.append(_bubble_html(seg.text))
 
         if include_words and seg.words:
             word_bits: List[str] = []
             for w in seg.words:
-                w_range = f"{format_timestamp(w.start)}–{format_timestamp(w.end)}"
+                w_t = format_segment_time(w.start, doc.recording_start)
                 word_bits.append(
                     f"<span style=\"margin-right: 10px; white-space: nowrap;\">"
                     f"<span style=\"color: #c8c8dc;\">{html.escape(w.text)}</span> "
-                    f"<span style=\"color: #6e6e88; font-family: 'Cascadia Code', "
-                    f"'Consolas', monospace; font-size: 10px;\">"
-                    f"{html.escape(w_range)}</span></span>"
+                    f"<span style=\"color: #6e6e88; font-size: 10px;\">"
+                    f"{html.escape(w_t)}</span></span>"
                 )
             ## END for w in seg.words....
 
             parts.append(
-                "<div style=\"color: #9898b0; font-size: 11px; margin-top: 6px; "
+                "<div style=\"color: #9898b0; font-size: 11px; margin: 4px 8px 0 8px; "
                 "line-height: 1.6;\">"
                 + " ".join(word_bits)
                 + "</div>"
             )
         ## END if include_words and seg.words....
-
-        parts.append("</div>")
     ## END for seg in doc.segments....
 
     parts.append("</div>")
@@ -445,28 +561,46 @@ def render_html(doc: TranscriptDoc, *, include_words: bool = False) -> str:
 
 
 def render_plain(doc: TranscriptDoc, *, include_words: bool = False) -> str:
-    """Plain-text form matching the readable HTML layout (for clipboard)."""
+    """Plain-text chat-log form matching the readable HTML layout (clipboard)."""
     lines: List[str] = []
-    header = _header_bits(doc)
-    if header:
-        lines.append(" · ".join(header))
+    for h in _chat_header_lines(doc):
+        lines.append(h)
+    ## END for h in _chat_header_lines(doc)....
+
+    if lines:
         lines.append("")
-    ## END if header....
+    ## END if lines....
 
     if doc.plain_only:
         lines.append(doc.plain_text)
         return "\n".join(lines).rstrip() + "\n"
     ## END if doc.plain_only....
 
+    last_day: Optional[Tuple[int, int, int]] = None
+    if doc.recording_start is not None:
+        last_day = _day_key(doc.recording_start)
+    ## END if doc.recording_start....
+
     for seg in doc.segments:
-        t_label = f"[{format_timestamp(seg.start)} – {format_timestamp(seg.end)}]"
+        if doc.recording_start is not None:
+            seg_dt = _absolute_at(doc.recording_start, seg.start)
+            day = _day_key(seg_dt)
+            if last_day is not None and day != last_day:
+                lines.append(f"—— {format_day_header(seg_dt)} ——")
+                lines.append("")
+            ## END if day changed....
+
+            last_day = day
+        ## END if doc.recording_start....
+
+        time_label = format_segment_time(seg.start, doc.recording_start)
         conf_label = _confidence_pct(seg.confidence)
-        head = t_label if not conf_label else f"{t_label}  {conf_label}"
+        head = time_label if not conf_label else f"{time_label}  {conf_label}"
         lines.append(head)
         lines.append(seg.text)
         if include_words and seg.words:
             word_line = "  ".join(
-                f"{w.text} {format_timestamp(w.start)}–{format_timestamp(w.end)}"
+                f"{w.text} {format_segment_time(w.start, doc.recording_start)}"
                 for w in seg.words
             )
             lines.append(f"  {word_line}")
