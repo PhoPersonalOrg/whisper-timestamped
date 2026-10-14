@@ -4,27 +4,14 @@
 			"path": "."
 		},
 		{
-			// "path": "C:/Users/pho/repos/EmotivEpoc/LSL_REPOS/LSL/PhoPyLSLhelper"
-            "path": "../phopylslhelper"
+			"path": "../phopylslhelper"
 		},
 		{
 			"path": "../emotiv-lsl"
 		},
-		// {
-		// 	"path": "C:/Users/pho/repos/EmotivEpoc/TimefluxRepos"
-		// },
-		// {
-		// 	"path": "C:/Users/pho/repos/EmotivEpoc/flutter_application_final_emotiv_logger"
-		// },
-		// {
-		// 	"path": "C:/Users/pho/repos/EmotivEpoc/PhoLabStreamingReceiver"
-		// },
-		// {
-		// 	"path": "C:/Users/pho/repos/EmotivEpoc/PhoOfflineEEGAnalysis"
-		// },
-		// {
-		// 	"path": "C:/Users/pho/repos/EmotivEpoc/LSL_REPOS/LSL_Video_Acquisition"
-		// }
+		{
+			"path": "../continuous_video_recorder"
+		}
 	],
 	"settings": {
 		"python.languageServer": "None",
@@ -43,12 +30,12 @@
 					"useVsCodeApi": true,
 					"command": "workbench.action.navigateForward"
 				},
-				{
-					"name": "Toggle Cell Output Scrolling",
-					"color": "orange",
-					"useVsCodeApi": true,
-					"command": "notebook.cell.toggleOutputScrolling"
-				},
+				// {
+				// 	"name": "Toggle Cell Output Scrolling",
+				// 	"color": "orange",
+				// 	"useVsCodeApi": true,
+				// 	"command": "notebook.cell.toggleOutputScrolling"
+				// },
 				{
 					"name": "Restart Python Language Server",
 					"color": "#00FF00",
@@ -61,18 +48,25 @@
 				//     "useVsCodeApi": true,
 				//     "command": "python.analysis.restartLanguageServer"
 				// },
-				{
-					"name": "VSCode Dev Consoler",
-					"color": "#99CCFF",
-					"useVsCodeApi": true,
-					"command": "workbench.action.toggleDevTools"
-				},
+				// {
+				// 	"name": "VSCode Dev Consoler",
+				// 	"color": "#99CCFF",
+				// 	"useVsCodeApi": true,
+				// 	"command": "workbench.action.toggleDevTools"
+				// },
 				{
 					"name": "Launch the Live Transcriber",
 					"tooltip": "Build the JupyterBook project",
 					"color": "#ed5700",
 					"useVsCodeApi": false,
 					"command": ".venv\\Scripts\\python.exe .\\scripts\\test_live_whisper_app.py"
+				},
+				{
+					"name": "Launch Recording Transcriber GUI",
+					"tooltip": "Launch Recording Transcriber GUI",
+					"color": "#ed9600",
+					"useVsCodeApi": false,
+					"command": "uv run python scripts/gui"
 				},
 				{
 					"name": "⇥ Convert to File Spaces",

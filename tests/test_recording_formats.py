@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from whisper_timestamped.recording_formats import (
     detect_format,
@@ -23,6 +26,8 @@ from whisper_timestamped.recording_formats.just_press_record import (
 )
 from whisper_timestamped.recording_formats.rec_continuous import (
     RecContinuousFormat,
+    RecContinuousVideoRecorderFormat,
+    sidecar_path_for,
 )
 from whisper_timestamped.recording_formats.voice_memos import (
     VoiceMemosFormat,
@@ -39,6 +44,7 @@ class TestFormatRegistry(unittest.TestCase):
             {
                 "debut",
                 "rec_continuous",
+                "rec_continuous_video_recorder",
                 "ios_whisper_app",
                 "just_press_record",
                 "voice_memos",
@@ -47,6 +53,11 @@ class TestFormatRegistry(unittest.TestCase):
 
     def test_get_format(self):
         self.assertEqual(get_format("voice_memos").id, "voice_memos")
+        self.assertEqual(
+            get_format("REC_continuous_video_recorder").id,
+            "rec_continuous_video_recorder",
+        )
+        self.assertEqual(get_format("rec_continuous").id, "rec_continuous")
         with self.assertRaises(KeyError):
             get_format("nope")
 
@@ -63,9 +74,67 @@ class TestDebutAndCam(unittest.TestCase):
         self.assertNotIn("filelist_csv", kwargs)
 
     def test_cam_matches(self):
-        fmt = RecContinuousFormat()
+        fmt = RecContinuousVideoRecorderFormat()
+        self.assertTrue(fmt.matches_file(Path("CAM_2026-01-09T081552.mkv")))
         self.assertTrue(fmt.matches_file(Path("CAM_2026-01-09T081552.mp4")))
         self.assertFalse(fmt.matches_file(Path("Debut_2026-01-09T081552.mp4")))
+        alias = RecContinuousFormat()
+        self.assertEqual(alias.id, "rec_continuous")
+        self.assertTrue(alias.matches_file(Path("CAM_2026-01-09T081552.mkv")))
+
+    def test_filename_creation_time_fallback(self):
+        fmt = RecContinuousVideoRecorderFormat()
+        path = Path("CAM_2026-01-09T081552.mkv")
+        self.assertEqual(
+            fmt.extract_creation_time(path), "2026-01-09 08:15:52"
+        )
+
+    def test_sidecar_preferred_creation_time(self):
+        fmt = RecContinuousVideoRecorderFormat()
+        tz_name = "America/Los_Angeles"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "CAM_2026-06-22T185618.mkv"
+            media.write_bytes(b"x")
+            # 2026-06-22 18:56:18 UTC → Pacific daylight (UTC-7)
+            wall_unix = datetime(
+                2026, 6, 22, 18, 56, 18, tzinfo=timezone.utc
+            ).timestamp()
+            sidecar = sidecar_path_for(media)
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "wall_clock_start_unix": wall_unix,
+                        "segment_index": 0,
+                        "duration_perf_seconds": 12.5,
+                        "lsl_local_clock_start": 99.1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            expected = (
+                datetime.fromtimestamp(wall_unix, tz=timezone.utc)
+                .astimezone(ZoneInfo(tz_name))
+                .replace(tzinfo=None)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self.assertEqual(
+                fmt.extract_creation_time(media, tz_name=tz_name), expected
+            )
+            fields = fmt.extra_row_fields(media)
+            self.assertEqual(fields["timing_sidecar"], str(sidecar))
+            self.assertEqual(fields["segment_index"], 0)
+            self.assertEqual(fields["duration_perf_seconds"], 12.5)
+            self.assertEqual(fields["lsl_local_clock_start"], 99.1)
+
+    def test_detect_cam_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CAM_2026-01-09T081552.mkv").write_bytes(b"x")
+            (root / "CAM_2026-01-09T091552.mkv").write_bytes(b"x")
+            detected = detect_format(root)
+            self.assertIsNotNone(detected)
+            self.assertEqual(detected.id, "rec_continuous_video_recorder")
 
 
 class TestJustPressRecord(unittest.TestCase):

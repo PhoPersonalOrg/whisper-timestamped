@@ -471,10 +471,12 @@ class MainWindow(QMainWindow):
             return "voice_memos"
         if "jpr" in name or "just_press" in name:
             return "just_press_record"
-        if "debut" in name:
-            return "debut"
+        if "rec_continuous_video_recorder" in name:
+            return "rec_continuous_video_recorder"
         if "rec_continuous" in name:
             return "rec_continuous"
+        if "debut" in name:
+            return "debut"
         # Default to ios_whisper_app for WhisperApp CSVs
         return "ios_whisper_app"
 

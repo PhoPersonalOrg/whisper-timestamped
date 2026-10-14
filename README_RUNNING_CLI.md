@@ -36,7 +36,7 @@ uv run python scripts/process_recordings.py \
 
 | Flag | Purpose |
 |------|---------|
-| `--format` / `-f` | Format id: `debut`, `ios_whisper_app`, `just_press_record`, `rec_continuous`, `voice_memos` (default: `ios_whisper_app`) |
+| `--format` / `-f` | Format id: `debut`, `ios_whisper_app`, `just_press_record`, `rec_continuous_video_recorder` (alias `rec_continuous`), `voice_memos` (default: `ios_whisper_app`) |
 | `--filelist` | CSV with a `full_path` column; mutually exclusive with `--recordings_dir` |
 | `--recordings_dir` | Directory to glob for media; mutually exclusive with `--filelist` |
 | `--output_dir` | Where transcripts are written (default: format’s `default_output_dir`) |

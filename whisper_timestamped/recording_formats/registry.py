@@ -15,19 +15,27 @@ from whisper_timestamped.recording_formats.just_press_record import (
 )
 from whisper_timestamped.recording_formats.rec_continuous import (
     RecContinuousFormat,
+    RecContinuousVideoRecorderFormat,
 )
 from whisper_timestamped.recording_formats.voice_memos import VoiceMemosFormat
 
 # Most-specific-first for detect_format.
+# Canonical CAM_* id is rec_continuous_video_recorder; rec_continuous is alias only.
 _DETECT_ORDER: List[RecordingsFormat] = [
     VoiceMemosFormat(),
     JustPressRecordFormat(),
     DebutFormat(),
-    RecContinuousFormat(),
+    RecContinuousVideoRecorderFormat(),
     IOSWhisperAppFormat(),
 ]
 
-FORMATS: Dict[str, RecordingsFormat] = {f.id: f for f in _DETECT_ORDER}
+_ALIAS_FORMATS: List[RecordingsFormat] = [
+    RecContinuousFormat(),
+]
+
+FORMATS: Dict[str, RecordingsFormat] = {
+    f.id: f for f in (*_DETECT_ORDER, *_ALIAS_FORMATS)
+}
 
 
 def get_format(format_id: str) -> RecordingsFormat:

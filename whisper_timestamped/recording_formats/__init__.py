@@ -15,6 +15,10 @@ from whisper_timestamped.recording_formats.just_press_record import (
 )
 from whisper_timestamped.recording_formats.rec_continuous import (
     RecContinuousFormat,
+    RecContinuousVideoRecorderFormat,
+    parse_cam_filename,
+    read_timing_sidecar,
+    sidecar_path_for,
 )
 from whisper_timestamped.recording_formats.registry import (
     FORMATS,
@@ -37,6 +41,7 @@ __all__ = [
     "IOSWhisperAppFormat",
     "JustPressRecordFormat",
     "RecContinuousFormat",
+    "RecContinuousVideoRecorderFormat",
     "RecordingsFormat",
     "VoiceMemosFormat",
     "detect_format",
@@ -44,6 +49,9 @@ __all__ = [
     "list_format_ids",
     "load_voice_memos_metadata",
     "load_voice_memos_titles",
+    "parse_cam_filename",
     "parse_just_press_record_path",
     "parse_voice_memos_filename",
+    "read_timing_sidecar",
+    "sidecar_path_for",
 ]
