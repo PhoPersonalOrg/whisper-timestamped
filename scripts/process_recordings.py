@@ -389,6 +389,7 @@ def process_recordings(
     crisper_mode: str = "verbatim",
     crisper_runtime: str = "auto",
     filelist_csv: Optional[Path] = None,
+    interrupt: Optional[_GracefulInterruptState] = None,
 ):
     has_filelist = filelist_csv is not None
     has_dir = recordings_dir is not None
@@ -543,7 +544,10 @@ def process_recordings(
     output_files: dict = {}
     first_file_timed = True
     failed_files: List[Path] = []
-    interrupt = _GracefulInterruptState()
+    if interrupt is None:
+        interrupt = _GracefulInterruptState()
+    ## END if interrupt is None....
+
     interrupt.output_dir = output_dir
     interrupt.install()
 
@@ -563,7 +567,7 @@ def process_recordings(
     try:
         for audio_path, base_name, row_index in jobs:
             if interrupt.stop_after_current:
-                print("\nSoft-stop: not starting further recordings after Ctrl+C.")
+                print("\nSoft-stop: not starting further recordings after cancel.")
                 break
             ## END if interrupt.stop_after_current....
 
@@ -642,7 +646,7 @@ def process_recordings(
 
                 interrupt.current_base_name = None
                 if interrupt.stop_after_current:
-                    print("\nSoft-stop: finished current recording after Ctrl+C; stopping.")
+                    print("\nSoft-stop: finished current recording after cancel; stopping.")
                     break
                 ## END if interrupt.stop_after_current....
 
@@ -689,7 +693,7 @@ def process_recordings(
     if filelist_path is not None:
         print(f"Filelist updated: {filelist_path}")
     if interrupt.stop_after_current and not interrupt.force_abort:
-        print(f"\nStopped after Ctrl+C. Output files saved to: {output_dir.resolve()}")
+        print(f"\nStopped after cancel. Output files saved to: {output_dir.resolve()}")
     else:
         print(f"\nProcessing complete! Output files saved to: {output_dir.resolve()}")
     ## END if soft-stop vs complete....

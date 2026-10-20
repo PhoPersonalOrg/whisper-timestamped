@@ -57,11 +57,19 @@ class TranscribeWorker(QThread):
         self.crisper_mode = crisper_mode
         self.crisper_runtime = crisper_runtime
         self._cancel_requested = False
+        self._interrupt = None  # set in run() after lazy import
 
 
     def request_cancel(self) -> None:
         """Request a soft-stop after the current file finishes."""
         self._cancel_requested = True
+        if self._interrupt is not None:
+            self._interrupt.stop_after_current = True
+        ## END if self._interrupt is not None....
+
+        self.output_line.emit(
+            "Cancel requested — finishing current file, then stopping…"
+        )
 
 
     def run(self) -> None:
@@ -70,7 +78,13 @@ class TranscribeWorker(QThread):
             from scripts.process_recordings import (
                 process_recordings,
                 collect_extant_transcript_paths,
+                _GracefulInterruptState,
             )
+
+            self._interrupt = _GracefulInterruptState()
+            if self._cancel_requested:
+                self._interrupt.stop_after_current = True
+            ## END if self._cancel_requested....
 
             # Write selected rows to a temporary filelist CSV
             tmp = tempfile.NamedTemporaryFile(
@@ -99,6 +113,7 @@ class TranscribeWorker(QThread):
                     model_name=self.model_name,
                     crisper_mode=self.crisper_mode,
                     crisper_runtime=self.crisper_runtime,
+                    interrupt=self._interrupt,
                 )
             finally:
                 sys.stdout = old_stdout

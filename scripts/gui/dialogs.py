@@ -210,7 +210,7 @@ class TranscribeConfigDialog(QDialog):
         # CrisperWhisper mode
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("Verbatim", "verbatim")
-        self._mode_combo.addItem("Clean", "clean")
+        self._mode_combo.addItem("Intended", "intended")
         self._mode_label = QLabel("CrisperWhisper Mode:")
         form.addRow(self._mode_label, self._mode_combo)
 

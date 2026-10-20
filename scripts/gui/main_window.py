@@ -143,6 +143,11 @@ class MainWindow(QMainWindow):
         self._transcribe_all_btn.clicked.connect(self._on_transcribe_all_pending)
         toolbar.addWidget(self._transcribe_all_btn)
 
+        self._cancel_transcribe_btn = QPushButton("Cancel")
+        self._cancel_transcribe_btn.setEnabled(False)
+        self._cancel_transcribe_btn.clicked.connect(self._on_cancel_transcription)
+        toolbar.addWidget(self._cancel_transcribe_btn)
+
         toolbar.addSeparator()
 
         # Format filter
@@ -624,7 +629,17 @@ class MainWindow(QMainWindow):
 
         self._transcribe_btn.setEnabled(False)
         self._transcribe_all_btn.setEnabled(False)
+        self._cancel_transcribe_btn.setEnabled(True)
         self._status_label.setText("Transcribing…")
+
+
+    def _on_cancel_transcription(self) -> None:
+        """Soft-stop the transcription queue after the current file finishes."""
+        if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
+            return
+        self._transcribe_worker.request_cancel()
+        self._cancel_transcribe_btn.setEnabled(False)
+        self._status_label.setText("Cancelling…")
 
 
     def _on_transcribe_output(self, line: str) -> None:
@@ -659,6 +674,7 @@ class MainWindow(QMainWindow):
     def _on_transcription_done(self, completed: int, failed: int) -> None:
         self._transcribe_btn.setEnabled(True)
         self._transcribe_all_btn.setEnabled(True)
+        self._cancel_transcribe_btn.setEnabled(False)
         self._status_label.setText(
             f"Transcription complete: {completed} succeeded, {failed} failed"
         )
@@ -672,6 +688,7 @@ class MainWindow(QMainWindow):
     def _on_transcription_error(self, msg: str) -> None:
         self._transcribe_btn.setEnabled(True)
         self._transcribe_all_btn.setEnabled(True)
+        self._cancel_transcribe_btn.setEnabled(False)
         self._status_label.setText(f"Transcription error: {msg}")
         self._log_text.appendPlainText(f"\n✗ Error: {msg}")
         QMessageBox.critical(self, "Transcription Error", msg)
