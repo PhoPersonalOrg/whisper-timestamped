@@ -15,7 +15,10 @@ scripts_dir = Path(__file__).parent.parent / "scripts"
 if str(scripts_dir.resolve()) not in sys.path:
     sys.path.append(str(scripts_dir.resolve()))
 
-from process_recordings import process_recordings
+try:
+    from process_recordings import process_recordings
+except ImportError:
+    process_recordings = None
 
 
 VIDEO_EXTS = [".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".m4v"]
@@ -70,6 +73,8 @@ class Handler(FileSystemEventHandler):
             return
         self._recent.add(p)
         try:
+            if process_recordings is None:
+                raise RuntimeError("process_recordings module could not be imported from scripts/process_recordings.py")
             process_recordings(recordings_dir=self.recordings_dir, output_dir=self.output_dir, video_extensions=[p.suffix.lower()])
         finally:
             # prevent reprocessing for cool_down_s seconds
