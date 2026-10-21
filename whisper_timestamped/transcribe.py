@@ -1979,7 +1979,7 @@ def check_vad_method(method, with_version=False):
                 version = "v" + version
             try:
                 assert float(version[1:]) >= 1
-            except:
+            except Exception:
                 raise ValueError(f"Got unexpected silero version {version} (please check https://github.com/snakers4/silero-vad/wiki/Version-history-and-Available-Models)")
         if with_version:
             return ("silero", version)
@@ -1994,7 +1994,7 @@ def check_vad_method(method, with_version=False):
         try:
             method = eval(method)
             assert hasattr(method, '__iter__')
-        except:
+        except Exception:
             raise ValueError(f"Got unexpected VAD method {method}")
         return check_vad_method(method, with_version=with_version)
     return method
@@ -2645,7 +2645,7 @@ def load_model(
                         model_path = [os.path.join(folder, p) for p in model_path]
                     break
                 assert model_path is not None
-            except:
+            except Exception:
                 raise RuntimeError(f"Original error: {err}\nCould not find model {name} from HuggingFace nor local folders.")
     # Load HF Model
     hf_state_dict = torch_load(model_path)
@@ -3324,16 +3324,18 @@ def cli():
             json.dump(filtered_keys(result), sys.stdout, indent=2, ensure_ascii=False)
 
 
-def filtered_keys(result, keys = [
-    "text",
-    "segments", "words",
-    "language",
-    "start",
-    "end",
-    "confidence",
-    "language_probs",
-    "speech_activity",
-]):
+def filtered_keys(result, keys=None):
+    if keys is None:
+        keys = [
+            "text",
+            "segments", "words",
+            "language",
+            "start",
+            "end",
+            "confidence",
+            "language_probs",
+            "speech_activity",
+        ]
     if isinstance(result, dict):
         return {k: (filtered_keys(v, keys) if k not in ["language_probs"] else v) for k, v in result.items() if k in keys}
     if isinstance(result, list):
