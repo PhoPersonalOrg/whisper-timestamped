@@ -45,6 +45,7 @@ if _REPO_ROOT not in sys.path:
 
 from scripts.gui.audio_player import AudioPlayer
 from scripts.gui.dialogs import ScanConfigDialog, TranscribeConfigDialog
+from scripts.gui.discover_worker import DiscoverTranscriptsWorker
 from scripts.gui.preferences import load_prefs, save_prefs
 from scripts.gui.scan_worker import ScanWorker
 from scripts.gui.table_model import (
@@ -62,6 +63,10 @@ from scripts.gui.transcript_format import (
 )
 from scripts.gui.transcript_viewer import TranscriptViewerDialog
 from scripts.gui.transcribe_worker import TranscribeWorker
+from scripts.transcript_outputs import (
+    csv_derived_output_dir,
+    transcript_status_columns,
+)
 
 from scripts.iOSWhisperAppHelpers.extract_m4a_creation_times import (
     move_duplicates_to_dup_dir,
@@ -95,6 +100,7 @@ class MainWindow(QMainWindow):
         self._player = AudioPlayer(self)
         self._scan_worker: Optional[ScanWorker] = None
         self._transcribe_worker: Optional[TranscribeWorker] = None
+        self._discover_worker: Optional[DiscoverTranscriptsWorker] = None
         # Track loaded CSVs: format_id -> csv_path
         self._loaded_csvs: Dict[str, Path] = {}
         self._prefs = load_prefs()
@@ -507,6 +513,123 @@ class MainWindow(QMainWindow):
 
         self._auto_size_columns()
         QTimer.singleShot(0, self._auto_size_columns)
+        self._start_transcript_discovery()
+
+
+    def _discovery_jobs_from_model(self) -> List[dict]:
+        """Snapshot table rows for background transcript discovery."""
+        df = self._model.get_dataframe()
+        if df.empty:
+            return []
+        cols = ["name", "full_path", "format_id", "source_csv"] + transcript_status_columns()
+        jobs: List[dict] = []
+        for idx, row in df.iterrows():
+            job: dict = {"df_index": int(idx)}
+            for col in cols:
+                val = row.get(col, "") if col in df.columns else ""
+                if pd.isna(val):
+                    job[col] = ""
+                else:
+                    job[col] = str(val)
+                ## END if pd.isna(val)....
+            ## END for col in cols....
+
+            jobs.append(job)
+        ## END for idx, row in df.iterrows()....
+
+        return jobs
+
+
+    def _stop_transcript_discovery(self) -> None:
+        worker = self._discover_worker
+        if worker is None:
+            return
+        for signal, slot in (
+            (worker.row_updated, self._on_transcript_discovered),
+            (worker.progress, self._on_discovery_progress),
+            (worker.finished, self._on_discovery_finished),
+            (worker.error, self._on_discovery_error),
+        ):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
+            ## END try disconnect....
+        ## END for signal, slot....
+
+        worker.request_cancel()
+        if worker.isRunning():
+            worker.wait(1500)
+        ## END if worker.isRunning()....
+
+        self._discover_worker = None
+
+
+    def _start_transcript_discovery(self) -> None:
+        """Probe output folders for existing transcripts after a table load."""
+        self._stop_transcript_discovery()
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            return
+
+        jobs = self._discovery_jobs_from_model()
+        if not jobs:
+            return
+
+        saved_out = self._prefs.get("transcribe_output_dir", "") or ""
+        prefs_dir = Path(saved_out) if saved_out else None
+        self._discover_worker = DiscoverTranscriptsWorker(
+            jobs=jobs,
+            prefs_output_dir=prefs_dir,
+            parent=self,
+        )
+        self._discover_worker.row_updated.connect(self._on_transcript_discovered)
+        self._discover_worker.progress.connect(self._on_discovery_progress)
+        self._discover_worker.finished.connect(self._on_discovery_finished)
+        self._discover_worker.error.connect(self._on_discovery_error)
+        self._discover_worker.start()
+
+
+    def _on_discovery_progress(self, msg: str) -> None:
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            return
+        self._status_label.setText(msg)
+
+
+    def _on_transcript_discovered(self, df_index: int, transcript_cols: dict) -> None:
+        self._model.update_row(df_index, transcript_cols)
+        selection = self._table.selectionModel()
+        if selection is not None and selection.hasSelection():
+            proxy_index = selection.currentIndex()
+            if proxy_index.isValid():
+                source_index = self._proxy.mapToSource(proxy_index)
+                if source_index.isValid() and source_index.row() == df_index:
+                    row_data = self._model.get_row_data(source_index.row())
+                    if row_data is not None:
+                        self._update_transcript_preview(row_data)
+                    ## END if row_data is not None....
+                ## END if source_index matches discovered row....
+            ## END if proxy_index.isValid()....
+        ## END if selection hasSelection....
+
+
+    def _on_discovery_finished(self, found: int) -> None:
+        if found:
+            self._save_all_loaded_csvs()
+        ## END if found....
+
+        self._update_status_bar()
+        self._auto_size_columns()
+        if found:
+            counts = self._model.status_counts()
+            self._status_label.setText(
+                f"Found {found} existing transcript(s)  │  "
+                f"✓ {counts.get('transcribed', 0)} transcribed"
+            )
+        ## END if found....
+
+
+    def _on_discovery_error(self, msg: str) -> None:
+        self._status_label.setText(msg)
 
 
     def _auto_size_columns(self) -> None:
@@ -581,17 +704,15 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._stop_transcript_discovery()
+
         df = self._model.get_dataframe()
         selected_df = df.loc[source_rows].copy()
 
         # Determine output dir from the first row's source CSV
         first_csv = selected_df.iloc[0].get("source_csv", "")
         if pd.notna(first_csv) and str(first_csv).strip():
-            csv_path = Path(str(first_csv).strip())
-            if csv_path.parent.name.lower() == "filelists":
-                default_out = csv_path.parent.parent / "transcriptions"
-            else:
-                default_out = csv_path.parent / "transcriptions"
+            default_out = csv_derived_output_dir(Path(str(first_csv).strip()))
         else:
             saved_out = self._prefs.get("transcribe_output_dir", "") or ""
             default_out = Path(saved_out) if saved_out else Path("transcriptions")
@@ -599,6 +720,7 @@ class MainWindow(QMainWindow):
         # Show config dialog
         dlg = TranscribeConfigDialog(str(default_out), parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._start_transcript_discovery()
             return
 
         output_dir = dlg.output_dir()
@@ -704,13 +826,31 @@ class MainWindow(QMainWindow):
             return
 
         csv_path = Path(str(source_csv).strip())
-        # Save only the rows belonging to this CSV
+        self._write_source_csv(df, csv_path)
+
+
+    def _write_source_csv(self, df: pd.DataFrame, csv_path: Path) -> None:
+        """Write rows belonging to *csv_path* back to that filelist."""
+        if "source_csv" not in df.columns:
+            return
         mask = df["source_csv"] == str(csv_path)
         subset = df[mask].drop(columns=["status", "format_id", "source_csv"], errors="ignore")
         try:
             subset.to_csv(csv_path, index=False, encoding="utf-8")
         except OSError:
             pass
+
+
+    def _save_all_loaded_csvs(self) -> None:
+        """Persist transcript/status columns for every loaded filelist CSV."""
+        df = self._model.get_dataframe()
+        if df.empty or "source_csv" not in df.columns:
+            return
+        for csv_str in df["source_csv"].dropna().unique():
+            if not str(csv_str).strip():
+                continue
+            self._write_source_csv(df, Path(str(csv_str).strip()))
+        ## END for csv_str in unique source_csv....
 
 
     # -- Filter handlers -------------------------------------------------------
@@ -1047,6 +1187,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._save_prefs()
         self._player.cleanup()
+        self._stop_transcript_discovery()
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self._scan_worker.quit()
             self._scan_worker.wait(3000)

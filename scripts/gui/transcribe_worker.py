@@ -77,9 +77,9 @@ class TranscribeWorker(QThread):
             # Lazy import to avoid loading torch/whisper until needed
             from scripts.process_recordings import (
                 process_recordings,
-                collect_extant_transcript_paths,
                 _GracefulInterruptState,
             )
+            from scripts.transcript_outputs import collect_extant_status_cols, TRANSCRIPT_PATH_COLUMNS
 
             self._interrupt = _GracefulInterruptState()
             if self._cancel_requested:
@@ -136,12 +136,12 @@ class TranscribeWorker(QThread):
                     failed += 1
                     continue
 
-                transcript_cols = collect_extant_transcript_paths(
+                transcript_cols = collect_extant_status_cols(
                     self.output_dir, base_name
                 )
                 # Check if any transcript was produced
                 has_output = any(
-                    v for v in transcript_cols.values() if v
+                    transcript_cols.get(col) for col in TRANSCRIPT_PATH_COLUMNS
                 )
                 if has_output:
                     completed += 1

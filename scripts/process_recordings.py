@@ -17,6 +17,17 @@ from whisper_timestamped.parse_video_filename import build_EDF_compatible_video_
 from whisper_timestamped.recording_formats import get_format, list_format_ids
 # from whisper_timestamped import remove_non_speech
 from whisper_timestamped.transcribe import remove_non_speech
+from scripts.transcript_outputs import (
+    TRANSCRIPTION_PARAMS_KEY,
+    _discard_transcript_outputs,
+    collect_extant_status_cols,
+    ensure_transcript_status_columns,
+    find_extant_output_files,
+    flatten_write_results_to_transcript_cols,
+    params_sidecar_path,
+    params_to_filelist_cols,
+    write_params_sidecar,
+)
 
 
 DEFAULT_FORMAT = "ios_whisper_app"
@@ -99,32 +110,7 @@ except ImportError:
     write_srt = get_do_write("srt")
     write_vtt = get_do_write("vtt")
     write_tsv = get_do_write("tsv")
-    
 
-
-# Segment-level suffix per output format; whisper-timestamped uses .words.json for JSON.
-_OUTPUT_SUFFIX_BY_FORMAT = {
-    "json": ".words.json",
-    "csv": ".csv",
-    "txt": ".txt",
-    "vtt": ".vtt",
-    "srt": ".srt",
-    "tsv": ".tsv",
-}
-
-# All write_results keys → on-disk suffix (for filling transcript_* on skip/re-run).
-_TRANSCRIPT_OUTPUT_SPECS: List[Tuple[str, str]] = [
-    ("json", ".words.json"),
-    ("csv", ".csv"),
-    ("words.csv", ".words.csv"),
-    ("txt", ".txt"),
-    ("vtt", ".vtt"),
-    ("words.vtt", ".words.vtt"),
-    ("srt", ".srt"),
-    ("words.srt", ".words.srt"),
-    ("tsv", ".tsv"),
-    ("words.tsv", ".words.tsv"),
-]
 
 # Ctrl+C: 1× soft-stop after current file; 3× within this window force-aborts.
 _SIGINT_WINDOW_S = 2.0
@@ -189,88 +175,17 @@ class _GracefulInterruptState:
             )
 
 
-def _discard_transcript_outputs(output_dir: Path, base_name: str) -> List[Path]:
-    """Remove any transcript outputs for base_name so the file can be reprocessed."""
-    removed: List[Path] = []
-    output_file_path = output_dir.joinpath(base_name)
-    seen = set()
-    for _, suffix in _TRANSCRIPT_OUTPUT_SPECS:
-        a_file = output_file_path.with_suffix(suffix)
-        key = a_file.as_posix()
-        if key in seen:
-            continue
-        seen.add(key)
-        if a_file.exists() and a_file.is_file():
-            try:
-                a_file.unlink()
-                removed.append(a_file)
-            except OSError as e:
-                print(f"  ~ Could not remove partial output {a_file.name}: {e}")
-        ## END if a_file exists....
-    ## END for _, suffix in _TRANSCRIPT_OUTPUT_SPECS....
-
-    return removed
-
-
-def _transcript_column_for_key(key: str) -> str:
-    return f"transcript_{key.replace('.', '_')}"
-
-
-def collect_extant_transcript_paths(output_dir: Path, base_name: str) -> Dict[str, str]:
-    """Map transcript_* column -> absolute path for outputs that already exist."""
-    output_file_path = output_dir.joinpath(base_name)
-    cols: Dict[str, str] = {}
-    for key, suffix in _TRANSCRIPT_OUTPUT_SPECS:
-        a_file = output_file_path.with_suffix(suffix)
-        col = _transcript_column_for_key(key)
-        if a_file.exists() and a_file.is_file():
-            cols[col] = str(a_file.resolve())
-        else:
-            cols[col] = ""
-        ## END if a_file exists....
-    ## END for key, suffix in _TRANSCRIPT_OUTPUT_SPECS....
-
-    return cols
-
-
-def flatten_write_results_to_transcript_cols( curr_output_files_dict: dict, base_name: str) -> Dict[str, str]:
-    """Map write_results nested dict to transcript_* absolute path strings."""
-    cols: Dict[str, str] = {
-        _transcript_column_for_key(key): "" for key, _ in _TRANSCRIPT_OUTPUT_SPECS
-    }
-    for key, by_base in curr_output_files_dict.items():
-        path = by_base.get(base_name)
-        col = _transcript_column_for_key(key)
-        if path is not None:
-            cols[col] = str(Path(path).resolve())
-        ## END if path is not None....
-    ## END for key, by_base in curr_output_files_dict.items()....
-
-    return cols
-
-
-def find_extant_output_files(output_dir: Path, base_name: str, output_formats = ['json', 'csv', 'srt', 'vtt', 'txt']) -> List[Path]:
-    """ found any of the output files that would be created upon transcode completion in the output_dir 
-
-    found_output_files: List[Path] = find_extant_output_files(output_dir=output_dir, base_name=base_name, output_formats=output_formats)
-
-    """
-    output_file_path: Path = output_dir.joinpath(base_name)
-    found_output_files: List[Path] = []
-    for fmt in output_formats:
-        suffix = _OUTPUT_SUFFIX_BY_FORMAT.get(fmt, f".{fmt}")
-        a_file: Path = output_file_path.with_suffix(suffix)
-        if a_file.exists() and a_file.is_file():
-            found_output_files.append(a_file)
-
-    return found_output_files
-
-
 def _register_output(output_files: dict, key: str, base_name: str, path: Path) -> None:
     output_files.setdefault(key, {})[base_name] = path
 
 
-def write_results(result, output_dir: Path, base_name: str, output_formats = ['json', 'csv', 'srt', 'vtt', 'txt']):
+def write_results(
+    result,
+    output_dir: Path,
+    base_name: str,
+    output_formats=['json', 'csv', 'srt', 'vtt', 'txt'],
+    params: Optional[Dict] = None,
+):
     """ Writes the results object out to disk
     base_name = video_file.stem
     output_files = write_results(result, output_dir=output_dir, base_name=base_name)
@@ -283,8 +198,14 @@ def write_results(result, output_dir: Path, base_name: str, output_formats = ['j
     if "json" in output_formats:
         try:
             a_file = output_file_path.with_suffix(".words.json")
+            payload = dict(result) if isinstance(result, dict) else result
+            if params and isinstance(payload, dict):
+                payload = dict(payload)
+                payload[TRANSCRIPTION_PARAMS_KEY] = params
+            ## END if params and isinstance(payload, dict)....
+
             with open(a_file, "w", encoding="utf-8") as js:
-                json.dump(result, js, indent=2, ensure_ascii=False)
+                json.dump(payload, js, indent=2, ensure_ascii=False)
             _register_output(output_files, "json", base_name, a_file)
             print(f"  ✓ Saved: {a_file.name}")
         except Exception as e:
@@ -375,6 +296,16 @@ def write_results(result, output_dir: Path, base_name: str, output_formats = ['j
             print(f"  ✓ Saved: {a_file.name}")
         except Exception as e:
             print(f"  ✗ Error saving words TSV: {e}")
+
+    if params:
+        try:
+            sidecar = write_params_sidecar(output_dir, base_name, params)
+            _register_output(output_files, "params", base_name, sidecar)
+            print(f"  ✓ Saved: {sidecar.name}")
+        except Exception as e:
+            print(f"  ✗ Error saving params: {e}")
+        ## END try write params sidecar....
+    ## END if params....
 
     return output_files
 
@@ -469,13 +400,7 @@ def process_recordings(
             jobs.append((audio_path, base_name, idx))
         ## END for idx, row in filelist_df.iterrows()....
 
-        # Ensure transcript_* columns exist up front.
-        for key, _ in _TRANSCRIPT_OUTPUT_SPECS:
-            col = _transcript_column_for_key(key)
-            if col not in filelist_df.columns:
-                filelist_df[col] = ""
-            ## END if col missing....
-        ## END for key, _ in _TRANSCRIPT_OUTPUT_SPECS....
+        ensure_transcript_status_columns(filelist_df)
     else:
         recordings_dir = host_path(recordings_dir).resolve()
         print(f'processing_recordings for recordings_dir: "{recordings_dir.as_posix()}"...')
@@ -541,6 +466,17 @@ def process_recordings(
     get_vad_segments(torch.zeros(16000, dtype=torch.float32), method="silero")  # 1s at 16kHz (Whisper SAMPLE_RATE)
     print("Done.")
 
+    run_params = {
+        "backend": backend,
+        "model_name": model_name,
+        "crisper_mode": crisper_mode,
+        "crisper_runtime": crisper_runtime,
+        "language": "en",
+        "vad": "silero",
+        "remove_empty_words": True,
+        "device": device,
+    }
+
     output_files: dict = {}
     first_file_timed = True
     failed_files: List[Path] = []
@@ -596,7 +532,7 @@ def process_recordings(
                     if row_index is not None:
                         _persist_filelist_row(
                             row_index,
-                            collect_extant_transcript_paths(output_dir, base_name),
+                            collect_extant_status_cols(output_dir, base_name),
                         )
                     ## END if row_index is not None....
 
@@ -627,7 +563,10 @@ def process_recordings(
                     first_file_timed = False
 
                 curr_output_files_dict = write_results(
-                    result, output_dir=output_dir, base_name=base_name
+                    result,
+                    output_dir=output_dir,
+                    base_name=base_name,
+                    params=run_params,
                 )
                 for k, curr_out_files_dict in curr_output_files_dict.items():
                     if k not in output_files:
@@ -636,12 +575,17 @@ def process_recordings(
                 ## END for k, curr_out_files_dict in curr_output_files_dict.items()....
 
                 if row_index is not None:
-                    _persist_filelist_row(
-                        row_index,
-                        flatten_write_results_to_transcript_cols(
-                            curr_output_files_dict, base_name
-                        ),
+                    transcript_cols = flatten_write_results_to_transcript_cols(
+                        curr_output_files_dict, base_name
                     )
+                    sidecar = params_sidecar_path(output_dir, base_name)
+                    transcript_cols.update(
+                        params_to_filelist_cols(
+                            run_params,
+                            sidecar if sidecar.is_file() else None,
+                        )
+                    )
+                    _persist_filelist_row(row_index, transcript_cols)
                 ## END if row_index is not None....
 
                 interrupt.current_base_name = None

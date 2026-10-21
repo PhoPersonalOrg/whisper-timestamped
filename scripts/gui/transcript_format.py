@@ -12,19 +12,10 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from scripts.transcript_outputs import TRANSCRIPT_PATH_COLUMNS
+
 # Columns that may hold transcript output paths on a recording row.
-_TRANSCRIPT_PATH_COLS: Sequence[str] = (
-    "transcript_json",
-    "transcript_srt",
-    "transcript_vtt",
-    "transcript_txt",
-    "transcript_csv",
-    "transcript_words_csv",
-    "transcript_tsv",
-    "transcript_words_srt",
-    "transcript_words_vtt",
-    "transcript_words_tsv",
-)
+_TRANSCRIPT_PATH_COLS: Sequence[str] = TRANSCRIPT_PATH_COLUMNS
 
 # Longest-first so ".words.json" wins over ".json".
 _TRANSCRIPT_SUFFIXES: Sequence[str] = (

@@ -23,6 +23,10 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QBrush, QColor, QFont
 
 from scripts.gui.style import ROW_TINTS
+from scripts.transcript_outputs import (
+    ensure_transcript_status_columns,
+    has_transcript_path_values,
+)
 
 
 def parse_created_datetime(value: Any) -> Optional[datetime]:
@@ -131,10 +135,7 @@ def compute_status(row: pd.Series) -> str:
     dup = row.get("is_duplicate")
     if pd.notna(dup) and (dup is True or str(dup).strip().lower() in ("true", "1", "yes")):
         return "duplicate"
-    # Check for any transcript output
-    txt = row.get("transcript_txt", "")
-    json_col = row.get("transcript_json", "")
-    if (pd.notna(txt) and str(txt).strip()) or (pd.notna(json_col) and str(json_col).strip()):
+    if has_transcript_path_values(row):
         return "transcribed"
     return "pending"
 
@@ -164,6 +165,8 @@ class RecordingTableModel(QAbstractTableModel):
                 self._df[col] = ""
         ## END for col in self._columns...
 
+        ensure_transcript_status_columns(self._df)
+
         # Compute status column
         self._df["status"] = self._df.apply(compute_status, axis=1)
         self.endResetModel()
@@ -175,8 +178,11 @@ class RecordingTableModel(QAbstractTableModel):
         if df_index not in self._df.index:
             return
         for col, value in updates.items():
-            if col in self._df.columns:
-                self._df.at[df_index, col] = value
+            if col not in self._df.columns:
+                self._df[col] = ""
+            if self._df[col].dtype != "object":
+                self._df[col] = self._df[col].astype("object")
+            self._df.at[df_index, col] = value
         ## END for col, value in updates.items()...
 
         # Recompute status
@@ -279,7 +285,14 @@ class RecordingTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             if col_name == "transcript_txt":
                 val = str(raw_value).strip() if pd.notna(raw_value) else ""
-                return val if val else "Not transcribed"
+                if not val:
+                    return "Not transcribed"
+                backend = str(self._df.iloc[row].get("transcript_backend", "") or "").strip()
+                model = str(self._df.iloc[row].get("transcript_model", "") or "").strip()
+                if backend or model:
+                    bits = [p for p in (backend, model) if p]
+                    return f"{val}\n{' / '.join(bits)}"
+                return val
             if col_name == "name":
                 full_path = self._df.iloc[row].get("full_path", "")
                 return str(full_path) if pd.notna(full_path) else ""

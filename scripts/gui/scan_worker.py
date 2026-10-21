@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from whisper_timestamped.recording_formats import (
@@ -21,6 +22,7 @@ from scripts.iOSWhisperAppHelpers.extract_m4a_creation_times import (
     build_file_list_from_audio_dir,
     extract_for_csv,
 )
+from scripts.transcript_outputs import merge_transcript_status_columns
 
 
 class ScanWorker(QThread):
@@ -40,6 +42,15 @@ class ScanWorker(QThread):
 
     def run(self) -> None:
         try:
+            previous_df: Optional[pd.DataFrame] = None
+            if self.csv_path.is_file():
+                try:
+                    previous_df = pd.read_csv(self.csv_path)
+                except (OSError, pd.errors.ParserError, UnicodeDecodeError):
+                    previous_df = None
+                ## END try read previous CSV....
+            ## END if self.csv_path.is_file()....
+
             # Step 1: Build filelist CSV from the audio directory
             self.progress.emit(f"Scanning {self.audio_dir.name} ({self.fmt.id})…")
             build_file_list_from_audio_dir(
@@ -62,6 +73,13 @@ class ScanWorker(QThread):
                 tz_name=self.tz_name,
                 fmt=self.fmt,
             )
+
+            if previous_df is not None:
+                self.progress.emit("Preserving existing transcript status…")
+                new_df = pd.read_csv(self.csv_path)
+                merged = merge_transcript_status_columns(new_df, previous_df)
+                merged.to_csv(self.csv_path, index=False, encoding="utf-8")
+            ## END if previous_df is not None....
 
             summary = (
                 f"Scan complete: {probed} probed, {creation_ok} creation times, "
