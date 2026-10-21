@@ -8,6 +8,7 @@ Provides:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,45 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QBrush, QColor, QFont
 
 from scripts.gui.style import ROW_TINTS
+
+
+def parse_created_datetime(value: Any) -> Optional[datetime]:
+    """Parse a filelist creation timestamp into naive local wall-clock time."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (ValueError, TypeError):
+        pass
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    dt = parsed.to_pydatetime()
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    ## END if tzinfo....
+
+    return dt
+
+
+def format_created_display(value: Any) -> str:
+    """12-hour local datetime, e.g. ``Oct 20, 7:14am``."""
+    dt = parse_created_datetime(value)
+    if dt is None:
+        return ""
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    minute = dt.strftime("%M")
+    ampm = dt.strftime("%p").lower()
+    date_part = dt.strftime("%b %d").replace(" 0", " ")
+    if dt.year != datetime.now().year:
+        date_part = f"{date_part}, {dt.year}"
+    ## END if dt.year != datetime.now().year....
+
+    return f"{date_part}, {hour}:{minute}{ampm}"
 
 
 # -- Column configuration -----------------------------------------------------
@@ -206,6 +246,16 @@ class RecordingTableModel(QAbstractTableModel):
                 if val:
                     return Path(val).name
                 return ""
+            if col_name == "extracted_creation_time":
+                return format_created_display(raw_value)
+            if pd.isna(raw_value):
+                return ""
+            return str(raw_value)
+
+        if role == Qt.ItemDataRole.UserRole:
+            if col_name == "extracted_creation_time":
+                dt = parse_created_datetime(raw_value)
+                return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else ""
             if pd.isna(raw_value):
                 return ""
             return str(raw_value)
@@ -233,6 +283,9 @@ class RecordingTableModel(QAbstractTableModel):
             if col_name == "name":
                 full_path = self._df.iloc[row].get("full_path", "")
                 return str(full_path) if pd.notna(full_path) else ""
+            if col_name == "extracted_creation_time":
+                dt = parse_created_datetime(raw_value)
+                return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else ""
             return None
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
@@ -275,6 +328,13 @@ class RecordingTableModel(QAbstractTableModel):
         if "format_id" not in self._df.columns:
             return []
         return sorted(self._df["format_id"].dropna().unique().tolist())
+
+
+    def column_name(self, column: int) -> str:
+        """Return the backing column name for a visual column index."""
+        if 0 <= column < len(self._columns):
+            return self._columns[column]
+        return ""
 
 
 # -- Filter Proxy Model -------------------------------------------------------
@@ -345,3 +405,15 @@ class RecordingFilterProxy(QSortFilterProxyModel):
                 return False
 
         return True
+
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        """Sort Created by the original timestamp, not the 12-hour display string."""
+        model = self.sourceModel()
+        if isinstance(model, RecordingTableModel) and model.column_name(left.column()) == "extracted_creation_time":
+            left_key = model.data(left, Qt.ItemDataRole.UserRole) or ""
+            right_key = model.data(right, Qt.ItemDataRole.UserRole) or ""
+            return left_key < right_key
+        ## END if created column....
+
+        return super().lessThan(left, right)
