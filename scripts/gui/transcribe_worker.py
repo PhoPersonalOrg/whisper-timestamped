@@ -7,15 +7,16 @@ live progress.
 
 from __future__ import annotations
 
-import contextlib
 import io
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Optional, Set
 
 import pandas as pd
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from scripts.transcribe_queue import ARM_DF_INDEX_COL, coerce_row_index
 
 
 class _SignalWriter(io.TextIOBase):
@@ -44,13 +45,18 @@ class TranscribeWorker(QThread):
     """Run process_recordings() in a background thread with live output capture."""
 
     output_line = pyqtSignal(str)
-    file_completed = pyqtSignal(int, dict)   # (df_index, transcript_cols)
-    all_done = pyqtSignal(int, int)           # (completed_count, failed_count)
+    file_started = pyqtSignal(int, str, int, int)  # (df_index, name, i, n)
+    file_progress = pyqtSignal(int, float)         # (df_index, 0..1)
+    file_completed = pyqtSignal(int, dict)         # (df_index, transcript_cols)
+    file_skipped = pyqtSignal(int, str)            # (df_index, reason)
+    file_failed = pyqtSignal(int, str)             # (df_index, message)
+    all_done = pyqtSignal(int, int, int)           # (completed, failed, cancelled)
     error = pyqtSignal(str)
 
     def __init__(self, rows_df: pd.DataFrame, output_dir: Path, backend: str = "crisperwhisper", model_name: str = "medium", crisper_mode: str = "verbatim", crisper_runtime: str = "auto", parent=None) -> None:
         super().__init__(parent)
         self.rows_df = rows_df.copy()
+        self.rows_df[ARM_DF_INDEX_COL] = [int(i) for i in self.rows_df.index]
         self.output_dir = output_dir
         self.backend = backend
         self.model_name = model_name
@@ -58,18 +64,89 @@ class TranscribeWorker(QThread):
         self.crisper_runtime = crisper_runtime
         self._cancel_requested = False
         self._interrupt = None  # set in run() after lazy import
+        self._skipped_indices: Set[int] = set()
+        self._current_df_index: Optional[int] = None
+        self._completed_count = 0
+        self._failed_count = 0
+        self._cancelled_count = 0
+
+
+    def skip_row(self, df_index: int) -> None:
+        """Remove a not-yet-started row from the transcription queue."""
+        idx = int(df_index)
+        if self._current_df_index is not None and idx == self._current_df_index:
+            return
+        self._skipped_indices.add(idx)
+        if self._interrupt is not None:
+            self._interrupt.skip_indices.add(idx)
 
 
     def request_cancel(self) -> None:
         """Request a soft-stop after the current file finishes."""
         self._cancel_requested = True
+        remaining = [
+            int(i) for i in self.rows_df.index
+            if self._current_df_index is None or int(i) != self._current_df_index
+        ]
+        self._skipped_indices.update(remaining)
         if self._interrupt is not None:
             self._interrupt.stop_after_current = True
+            self._interrupt.skip_indices.update(self._skipped_indices)
         ## END if self._interrupt is not None....
 
         self.output_line.emit(
             "Cancel requested — finishing current file, then stopping…"
         )
+
+
+    def _on_file_start(self, row_index, base_name, i, n) -> None:
+        df_index = coerce_row_index(row_index)
+        if df_index is None:
+            return
+        self._current_df_index = df_index
+        self.file_started.emit(df_index, str(base_name), int(i), int(n))
+
+
+    def _on_file_done(self, row_index, transcript_cols) -> None:
+        df_index = coerce_row_index(row_index)
+        if df_index is None:
+            return
+        self._completed_count += 1
+        if self._current_df_index == df_index:
+            self._current_df_index = None
+        self.file_completed.emit(df_index, dict(transcript_cols or {}))
+
+
+    def _on_file_skip(self, row_index, reason) -> None:
+        df_index = coerce_row_index(row_index)
+        if df_index is None:
+            return
+        reason_s = str(reason or "cancelled")
+        if reason_s == "cancelled":
+            self._cancelled_count += 1
+        if self._current_df_index == df_index:
+            self._current_df_index = None
+        self.file_skipped.emit(df_index, reason_s)
+
+
+    def _on_file_error(self, row_index, message) -> None:
+        df_index = coerce_row_index(row_index)
+        if df_index is None:
+            return
+        self._failed_count += 1
+        if self._current_df_index == df_index:
+            self._current_df_index = None
+        self.file_failed.emit(df_index, str(message or "Transcription failed"))
+
+
+    def _on_progress(self, fraction: float) -> None:
+        if self._current_df_index is None:
+            return
+        try:
+            value = float(fraction)
+        except (TypeError, ValueError):
+            return
+        self.file_progress.emit(self._current_df_index, max(0.0, min(1.0, value)))
 
 
     def run(self) -> None:
@@ -79,9 +156,9 @@ class TranscribeWorker(QThread):
                 process_recordings,
                 _GracefulInterruptState,
             )
-            from scripts.transcript_outputs import collect_extant_status_cols, TRANSCRIPT_PATH_COLUMNS
 
             self._interrupt = _GracefulInterruptState()
+            self._interrupt.skip_indices.update(self._skipped_indices)
             if self._cancel_requested:
                 self._interrupt.stop_after_current = True
             ## END if self._cancel_requested....
@@ -106,7 +183,7 @@ class TranscribeWorker(QThread):
             sys.stdout = writer
 
             try:
-                output_files = process_recordings(
+                process_recordings(
                     filelist_csv=tmp_path,
                     output_dir=self.output_dir,
                     backend=self.backend,
@@ -114,41 +191,16 @@ class TranscribeWorker(QThread):
                     crisper_mode=self.crisper_mode,
                     crisper_runtime=self.crisper_runtime,
                     interrupt=self._interrupt,
+                    on_file_start=self._on_file_start,
+                    on_file_done=self._on_file_done,
+                    on_file_skip=self._on_file_skip,
+                    on_file_error=self._on_file_error,
+                    on_progress=self._on_progress,
                 )
             finally:
                 sys.stdout = old_stdout
                 writer.flush()
             ## END try redirect stdout...
-
-            # Count results and emit per-row transcript paths
-            completed = 0
-            failed = 0
-            for idx, row in self.rows_df.iterrows():
-                name_raw = row.get("name", "")
-                if pd.notna(name_raw) and str(name_raw).strip():
-                    base_name = Path(str(name_raw).strip()).stem
-                else:
-                    full_path_raw = row.get("full_path", "")
-                    base_name = Path(str(full_path_raw).strip()).stem if pd.notna(full_path_raw) else ""
-                ## END if name present...
-
-                if not base_name:
-                    failed += 1
-                    continue
-
-                transcript_cols = collect_extant_status_cols(
-                    self.output_dir, base_name
-                )
-                # Check if any transcript was produced
-                has_output = any(
-                    transcript_cols.get(col) for col in TRANSCRIPT_PATH_COLUMNS
-                )
-                if has_output:
-                    completed += 1
-                    self.file_completed.emit(int(idx), transcript_cols)
-                else:
-                    failed += 1
-            ## END for idx, row in self.rows_df.iterrows()...
 
             # Clean up temp CSV
             try:
@@ -156,7 +208,9 @@ class TranscribeWorker(QThread):
             except OSError:
                 pass
 
-            self.all_done.emit(completed, failed)
+            self.all_done.emit(
+                self._completed_count, self._failed_count, self._cancelled_count
+            )
 
         except Exception as exc:
             self.error.emit(f"Transcription failed: {exc}")

@@ -102,7 +102,22 @@ _STATUS_ICONS = {
     "transcribed": "✓",
     "pending": "⏳",
     "duplicate": "✕",
+    "queued": "⋯",
+    "transcribing": "▶",
+    "cancelling": "⏹",
+    "failed": "!",
 }
+
+PENDING_LIKE_STATUSES = {
+    "pending",
+    "queued",
+    "transcribing",
+    "cancelling",
+    "failed",
+}
+
+PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 1
+JOB_PHASE_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
 # -- CSV loading helpers -------------------------------------------------------
@@ -153,11 +168,13 @@ class RecordingTableModel(QAbstractTableModel):
         self._columns: List[str] = list(DISPLAY_COLUMNS)
         self._dup_font = QFont()
         self._dup_font.setStrikeOut(True)
+        self._job_state: Dict[int, Dict[str, Any]] = {}
 
 
     def set_dataframe(self, df: pd.DataFrame) -> None:
         """Replace the model's backing DataFrame."""
         self.beginResetModel()
+        self._job_state = {}
         self._df = df.copy()
         # Ensure all display columns exist
         for col in self._columns:
@@ -173,6 +190,121 @@ class RecordingTableModel(QAbstractTableModel):
         self.data_changed_signal.emit()
 
 
+    def _emit_row_changed(self, df_index: int) -> None:
+        try:
+            visual_row = list(self._df.index).index(df_index)
+            left = self.index(visual_row, 0)
+            right = self.index(visual_row, len(self._columns) - 1)
+            self.dataChanged.emit(left, right)
+        except ValueError:
+            pass
+
+
+    def job_state(self, df_index: int) -> Optional[Dict[str, Any]]:
+        """Return runtime job overlay for *df_index*, if any."""
+        return self._job_state.get(int(df_index))
+
+
+    def set_job_state(
+        self,
+        df_index: int,
+        phase: str,
+        *,
+        progress: Optional[float] = None,
+        position: Optional[int] = None,
+        total: Optional[int] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Set ephemeral queued/transcribing/cancelling/failed overlay."""
+        key = int(df_index)
+        prev = self._job_state.get(key, {})
+        state: Dict[str, Any] = {
+            "phase": phase,
+            "progress": progress if progress is not None else prev.get("progress"),
+            "position": position if position is not None else prev.get("position"),
+            "total": total if total is not None else prev.get("total"),
+            "message": message if message is not None else prev.get("message"),
+        }
+        if progress is None and phase in ("queued", "failed"):
+            state["progress"] = None
+        self._job_state[key] = state
+        self._emit_row_changed(key)
+
+
+    def set_job_states(
+        self,
+        df_indices: List[int],
+        phase: str,
+    ) -> None:
+        """Mark many rows with the same phase (e.g. queued at batch start)."""
+        total = len(df_indices)
+        for i, df_index in enumerate(df_indices, start=1):
+            key = int(df_index)
+            self._job_state[key] = {
+                "phase": phase,
+                "progress": None,
+                "position": i,
+                "total": total,
+                "message": None,
+            }
+        ## END for i, df_index in enumerate....
+
+        if self._df.empty:
+            return
+        top_left = self.index(0, 0)
+        bottom_right = self.index(len(self._df) - 1, len(self._columns) - 1)
+        self.dataChanged.emit(top_left, bottom_right)
+
+
+    def clear_job_state(self, df_index: int) -> None:
+        """Drop runtime overlay so persisted status (pending/transcribed) shows."""
+        key = int(df_index)
+        if self._job_state.pop(key, None) is not None:
+            self._emit_row_changed(key)
+
+
+    def clear_all_job_state(self) -> None:
+        if not self._job_state:
+            return
+        self._job_state = {}
+        if self._df.empty:
+            return
+        top_left = self.index(0, 0)
+        bottom_right = self.index(len(self._df) - 1, len(self._columns) - 1)
+        self.dataChanged.emit(top_left, bottom_right)
+
+
+    def queued_df_indices(self) -> List[int]:
+        return [
+            idx for idx, state in self._job_state.items()
+            if state.get("phase") == "queued"
+        ]
+
+
+    def transcribing_df_index(self) -> Optional[int]:
+        for idx, state in self._job_state.items():
+            if state.get("phase") in ("transcribing", "cancelling"):
+                return idx
+            ## END if transcribing or cancelling....
+
+        ## END for idx, state in self._job_state.items()....
+
+        return None
+
+
+    def _status_for_visual_row(self, row: int) -> str:
+        df_index = int(self._df.index[row])
+        job = self._job_state.get(df_index)
+        if job:
+            return str(job.get("phase") or "pending")
+        return str(self._df.iloc[row].get("status", "pending"))
+
+
+    def _job_for_visual_row(self, row: int) -> Optional[Dict[str, Any]]:
+        df_index = int(self._df.index[row])
+        return self._job_state.get(df_index)
+
+
     def update_row(self, df_index: int, updates: Dict[str, Any]) -> None:
         """Update specific cells in a row by DataFrame index."""
         if df_index not in self._df.index:
@@ -185,16 +317,11 @@ class RecordingTableModel(QAbstractTableModel):
             self._df.at[df_index, col] = value
         ## END for col, value in updates.items()...
 
-        # Recompute status
+        # Recompute persisted status; keep in-flight overlay unless transcripts landed
         self._df.at[df_index, "status"] = compute_status(self._df.loc[df_index])
-        # Find the visual row for this df_index
-        try:
-            visual_row = list(self._df.index).index(df_index)
-            left = self.index(visual_row, 0)
-            right = self.index(visual_row, len(self._columns) - 1)
-            self.dataChanged.emit(left, right)
-        except ValueError:
-            pass
+        if has_transcript_path_values(self._df.loc[df_index]):
+            self._job_state.pop(int(df_index), None)
+        self._emit_row_changed(int(df_index))
 
 
     def get_dataframe(self) -> pd.DataFrame:
@@ -205,7 +332,9 @@ class RecordingTableModel(QAbstractTableModel):
     def get_row_data(self, row: int) -> Optional[pd.Series]:
         """Return the full Series for a visual row index."""
         if 0 <= row < len(self._df):
-            return self._df.iloc[row].copy()
+            series = self._df.iloc[row].copy()
+            series["status"] = self._status_for_visual_row(row)
+            return series
         return None
 
 
@@ -237,7 +366,16 @@ class RecordingTableModel(QAbstractTableModel):
             return None
 
         raw_value = self._df.iloc[row].get(col_name, "")
-        status = str(self._df.iloc[row].get("status", "pending"))
+        status = self._status_for_visual_row(row)
+        job = self._job_for_visual_row(row)
+
+        if role == PROGRESS_ROLE:
+            if job is None:
+                return None
+            return job.get("progress")
+
+        if role == JOB_PHASE_ROLE:
+            return job.get("phase") if job else None
 
         if role == Qt.ItemDataRole.DisplayRole:
             if col_name == "status":
@@ -283,6 +421,26 @@ class RecordingTableModel(QAbstractTableModel):
             return None
 
         if role == Qt.ItemDataRole.ToolTipRole:
+            if col_name == "status":
+                if job:
+                    phase = str(job.get("phase") or "")
+                    pos = job.get("position")
+                    total = job.get("total")
+                    progress = job.get("progress")
+                    if phase == "queued":
+                        if pos and total:
+                            return f"Queued {pos}/{total}"
+                        return "Queued"
+                    if phase == "transcribing":
+                        pct = f" {int(round(progress * 100))}%" if isinstance(progress, (int, float)) else ""
+                        if pos and total:
+                            return f"Transcribing {pos}/{total}{pct}"
+                        return f"Transcribing{pct}"
+                    if phase == "cancelling":
+                        return "Cancelling — finishing this file, then stopping"
+                    if phase == "failed":
+                        return str(job.get("message") or "Transcription failed")
+                return status
             if col_name == "transcript_txt":
                 val = str(raw_value).strip() if pd.notna(raw_value) else ""
                 if not val:
@@ -328,11 +486,25 @@ class RecordingTableModel(QAbstractTableModel):
     # -- Convenience -----------------------------------------------------------
 
     def status_counts(self) -> Dict[str, int]:
-        """Return counts by status for the status bar."""
+        """Return counts by display status for the status bar."""
+        counts = {
+            "transcribed": 0,
+            "pending": 0,
+            "duplicate": 0,
+            "queued": 0,
+            "transcribing": 0,
+            "cancelling": 0,
+            "failed": 0,
+            "total": 0,
+        }
         if "status" not in self._df.columns or self._df.empty:
-            return {"transcribed": 0, "pending": 0, "duplicate": 0, "total": 0}
-        counts = self._df["status"].value_counts().to_dict()
+            return counts
         counts["total"] = len(self._df)
+        for visual_row in range(len(self._df)):
+            status = self._status_for_visual_row(visual_row)
+            counts[status] = counts.get(status, 0) + 1
+        ## END for visual_row in range....
+
         return counts
 
 
@@ -392,9 +564,12 @@ class RecordingFilterProxy(QSortFilterProxyModel):
         if row_data is None:
             return False
 
-        # Status filter
+        # Status filter (Pending includes in-flight / failed-retryable rows)
         status = str(row_data.get("status", ""))
-        if self._status_filter and status != self._status_filter:
+        if self._status_filter == "pending":
+            if status not in PENDING_LIKE_STATUSES:
+                return False
+        elif self._status_filter and status != self._status_filter:
             return False
 
         # Hide duplicates toggle

@@ -6,7 +6,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import torch
@@ -27,6 +27,11 @@ from scripts.transcript_outputs import (
     params_sidecar_path,
     params_to_filelist_cols,
     write_params_sidecar,
+)
+from scripts.transcribe_queue import (
+    callback_row_index,
+    coerce_row_index,
+    job_loop_action,
 )
 
 
@@ -122,6 +127,7 @@ class _GracefulInterruptState:
     def __init__(self) -> None:
         self.stop_after_current = False
         self.force_abort = False
+        self.skip_indices: set = set()
         self._press_times: List[float] = []
         self.current_base_name: Optional[str] = None
         self.output_dir: Optional[Path] = None
@@ -310,6 +316,16 @@ def write_results(
     return output_files
 
 
+def _invoke_job_cb(callback: Optional[Callable], *args) -> None:
+    """Call an optional job callback, swallowing callback errors."""
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception as exc:
+        print(f"  ~ Job callback error: {type(exc).__name__}: {exc}")
+
+
 def process_recordings(
     recordings_dir: Optional[Path] = None,
     output_dir=None,
@@ -321,6 +337,11 @@ def process_recordings(
     crisper_runtime: str = "auto",
     filelist_csv: Optional[Path] = None,
     interrupt: Optional[_GracefulInterruptState] = None,
+    on_file_start: Optional[Callable] = None,
+    on_file_done: Optional[Callable] = None,
+    on_file_skip: Optional[Callable] = None,
+    on_file_error: Optional[Callable] = None,
+    on_progress: Optional[Callable] = None,
 ):
     has_filelist = filelist_csv is not None
     has_dir = recordings_dir is not None
@@ -333,8 +354,9 @@ def process_recordings(
 
     filelist_df: Optional[pd.DataFrame] = None
     filelist_path: Optional[Path] = None
-    # jobs: (audio_path, base_name, optional filelist row index)
-    jobs: List[Tuple[Path, str, Optional[object]]] = []
+    # jobs: (audio_path, base_name, persist_idx, callback_idx)
+    jobs: List[Tuple[Path, str, Optional[object], Optional[int]]] = []
+    handled_callback_indices: set = set()
 
     if has_filelist:
         filelist_path = host_path(filelist_csv).resolve()
@@ -366,6 +388,7 @@ def process_recordings(
         alias_dir = output_dir.parent / "edf_video_aliases"
 
         for idx, row in filelist_df.iterrows():
+            callback_idx = callback_row_index(idx, row)
             # Skip non-keepers flagged by extract_m4a_creation_times (bool or "true"/"1"/"yes")
             if "is_duplicate" in filelist_df.columns:
                 dup_raw = row.get("is_duplicate")
@@ -374,6 +397,9 @@ def process_recordings(
                     or str(dup_raw).strip().lower() in ("true", "1", "yes")
                 ):
                     print(f"  ~ Skipping duplicate row index={idx}")
+                    if callback_idx is not None:
+                        handled_callback_indices.add(callback_idx)
+                    _invoke_job_cb(on_file_skip, callback_idx, "duplicate")
                     continue
                 ## END if truthy is_duplicate....
             ## END if is_duplicate column....
@@ -381,12 +407,18 @@ def process_recordings(
             full_path_raw = row.get("full_path")
             if pd.isna(full_path_raw) or not str(full_path_raw).strip():
                 print(f"  ! Missing full_path for row index={idx}")
+                if callback_idx is not None:
+                    handled_callback_indices.add(callback_idx)
+                _invoke_job_cb(on_file_error, callback_idx, "Missing full_path")
                 continue
             ## END if full_path missing....
 
             audio_path = host_path(str(full_path_raw).strip()).resolve()
             if not audio_path.is_file():
                 print(f"  ! Missing audio file: {audio_path}")
+                if callback_idx is not None:
+                    handled_callback_indices.add(callback_idx)
+                _invoke_job_cb(on_file_error, callback_idx, f"Missing audio file: {audio_path}")
                 continue
             ## END if audio missing....
 
@@ -397,7 +429,7 @@ def process_recordings(
                 base_name = audio_path.stem
             ## END if name present....
 
-            jobs.append((audio_path, base_name, idx))
+            jobs.append((audio_path, base_name, idx, callback_idx))
         ## END for idx, row in filelist_df.iterrows()....
 
         ensure_transcript_status_columns(filelist_df)
@@ -422,7 +454,7 @@ def process_recordings(
         alias_dir = recordings_dir.parent / "edf_video_aliases"
 
         for video_file in video_files:
-            jobs.append((video_file, video_file.stem, None))
+            jobs.append((video_file, video_file.stem, None, None))
         ## END for video_file in video_files....
     ## END if has_filelist....
 
@@ -500,12 +532,37 @@ def process_recordings(
 
         filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
 
+    def _mark_handled(callback_idx: Optional[int]) -> None:
+        coerced = coerce_row_index(callback_idx)
+        if coerced is not None:
+            handled_callback_indices.add(coerced)
+
+    def _progress_hook(fraction: float) -> None:
+        _invoke_job_cb(on_progress, fraction)
+
+    n_jobs = len(jobs)
     try:
-        for audio_path, base_name, row_index in jobs:
-            if interrupt.stop_after_current:
+        from whisper_timestamped.crisperwhisper.longform.progress import (
+            set_audio_progress_callback,
+        )
+
+        for job_i, (audio_path, base_name, persist_idx, callback_idx) in enumerate(jobs, start=1):
+            action = job_loop_action(
+                interrupt.stop_after_current,
+                interrupt.skip_indices,
+                callback_idx,
+            )
+            if action == "stop":
                 print("\nSoft-stop: not starting further recordings after cancel.")
                 break
-            ## END if interrupt.stop_after_current....
+            ## END if action == "stop"....
+
+            if action == "skip":
+                print(f"  ~ Skipping cancelled job {audio_path.name} (index={callback_idx})")
+                _mark_handled(callback_idx)
+                _invoke_job_cb(on_file_skip, callback_idx, "cancelled")
+                continue
+            ## END if action == "skip"....
 
             print(f"\nProcessing: {audio_path.name} (base_name={base_name!r})")
             interrupt.current_base_name = base_name
@@ -529,16 +586,18 @@ def process_recordings(
                         f"  ✗ Skipping {audio_path.name} as its outputs already exist: "
                         f"{found_output_files}"
                     )
-                    if row_index is not None:
-                        _persist_filelist_row(
-                            row_index,
-                            collect_extant_status_cols(output_dir, base_name),
-                        )
-                    ## END if row_index is not None....
+                    transcript_cols = collect_extant_status_cols(output_dir, base_name)
+                    if persist_idx is not None:
+                        _persist_filelist_row(persist_idx, transcript_cols)
+                    ## END if persist_idx is not None....
 
                     interrupt.current_base_name = None
+                    _mark_handled(callback_idx)
+                    _invoke_job_cb(on_file_done, callback_idx, transcript_cols)
                     continue
                 ## END if found_output_files....
+
+                _invoke_job_cb(on_file_start, callback_idx, base_name, job_i, n_jobs)
 
                 if first_file_timed:
                     print("  Running VAD and transcription...")
@@ -550,14 +609,20 @@ def process_recordings(
                     print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
 
                 t0_transcribe = time.perf_counter()
-                result = whisper.transcribe(
-                    model,
-                    audio,
-                    language="en",
-                    vad="silero",
-                    remove_empty_words=True,
-                    crisper_mode=crisper_mode,
-                )
+                set_audio_progress_callback(_progress_hook if on_progress else None)
+                try:
+                    result = whisper.transcribe(
+                        model,
+                        audio,
+                        language="en",
+                        vad="silero",
+                        remove_empty_words=True,
+                        crisper_mode=crisper_mode,
+                    )
+                finally:
+                    set_audio_progress_callback(None)
+                ## END try transcribe with progress hook...
+
                 if first_file_timed:
                     print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")
                     first_file_timed = False
@@ -574,7 +639,8 @@ def process_recordings(
                     output_files[k].update(**curr_out_files_dict)
                 ## END for k, curr_out_files_dict in curr_output_files_dict.items()....
 
-                if row_index is not None:
+                transcript_cols: Dict[str, str] = {}
+                if persist_idx is not None:
                     transcript_cols = flatten_write_results_to_transcript_cols(
                         curr_output_files_dict, base_name
                     )
@@ -585,10 +651,16 @@ def process_recordings(
                             sidecar if sidecar.is_file() else None,
                         )
                     )
-                    _persist_filelist_row(row_index, transcript_cols)
-                ## END if row_index is not None....
+                    _persist_filelist_row(persist_idx, transcript_cols)
+                else:
+                    transcript_cols = flatten_write_results_to_transcript_cols(
+                        curr_output_files_dict, base_name
+                    )
+                ## END if persist_idx is not None....
 
                 interrupt.current_base_name = None
+                _mark_handled(callback_idx)
+                _invoke_job_cb(on_file_done, callback_idx, transcript_cols)
                 if interrupt.stop_after_current:
                     print("\nSoft-stop: finished current recording after cancel; stopping.")
                     break
@@ -619,15 +691,28 @@ def process_recordings(
             except Exception as e:
                 failed_files.append(audio_path)
                 print(f"  ✗ Error processing {audio_path.name}: [{type(e).__name__}] {e}")
-                if row_index is not None:
+                if persist_idx is not None and filelist_df is not None and filelist_path is not None:
                     # Leave transcript_* empty / unchanged for this failure; still flush CSV.
                     filelist_df.to_csv(filelist_path, index=False, encoding="utf-8")
-                ## END if row_index is not None....
+                ## END if persist_idx is not None....
 
                 interrupt.current_base_name = None
+                _mark_handled(callback_idx)
+                _invoke_job_cb(
+                    on_file_error, callback_idx, f"{type(e).__name__}: {e}"
+                )
                 continue
             ## END try/except per file....
-        ## END for audio_path, base_name, row_index in jobs....
+        ## END for job_i, (audio_path, base_name, persist_idx, callback_idx) in enumerate....
+
+        for _audio_path, _base_name, _persist_idx, leftover_idx in jobs:
+            coerced = coerce_row_index(leftover_idx)
+            if coerced is None or coerced in handled_callback_indices:
+                continue
+            handled_callback_indices.add(coerced)
+            _invoke_job_cb(on_file_skip, leftover_idx, "cancelled")
+        ## END for _audio_path, _base_name, _persist_idx, leftover_idx in jobs....
+
     finally:
         interrupt.restore()
     ## END try/finally interrupt handler....

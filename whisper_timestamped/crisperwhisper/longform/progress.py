@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator, Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -12,6 +13,38 @@ from whisper_timestamped.crisperwhisper.longform.base import SAMPLE_RATE
 
 # Match Whisper / CT2Engine mel hop (see engine.HOP_LENGTH).
 HOP_LENGTH = 160
+
+_progress_tls = threading.local()
+
+
+def set_audio_progress_callback(
+    callback: Optional[Callable[[float], None]],
+) -> None:
+    """Install a thread-local ``(fraction: float) -> None`` progress hook."""
+    _progress_tls.callback = callback
+
+
+def get_audio_progress_callback() -> Optional[Callable[[float], None]]:
+    return getattr(_progress_tls, "callback", None)
+
+
+class _CallbackTqdm(tqdm):
+    """tqdm that reports ``n / total`` to the thread-local progress hook."""
+
+    def update(self, n: float = 1):
+        previous = self.n
+        result = super().update(n)
+        callback = get_audio_progress_callback()
+        total = self.total
+        if callback is not None and total and self.n > previous:
+            try:
+                fraction = min(1.0, max(0.0, float(self.n) / float(total)))
+                callback(fraction)
+            except Exception:
+                pass
+        ## END if callback is not None and total....
+
+        return result
 
 
 def frame_pos(sample_index: int) -> int:
@@ -46,7 +79,7 @@ def audio_progress_bar(
     as ``disable=True`` via ``disable=verbose is not False``.
     """
     total = frame_pos(len(audio))
-    with tqdm(
+    with _CallbackTqdm(
         total=total,
         unit="frames",
         disable=verbose is not False,

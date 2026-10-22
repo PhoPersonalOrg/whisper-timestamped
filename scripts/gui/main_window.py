@@ -48,7 +48,9 @@ from scripts.gui.dialogs import ScanConfigDialog, TranscribeConfigDialog
 from scripts.gui.discover_worker import DiscoverTranscriptsWorker
 from scripts.gui.preferences import load_prefs, save_prefs
 from scripts.gui.scan_worker import ScanWorker
+from scripts.gui.status_delegate import NameProgressDelegate
 from scripts.gui.table_model import (
+    DISPLAY_COLUMNS,
     RecordingFilterProxy,
     RecordingTableModel,
     load_format_csv,
@@ -107,6 +109,10 @@ class MainWindow(QMainWindow):
         self._playing_row: int = -1
         self._current_preview_row_data: Optional[pd.Series] = None
         self._current_preview_doc: Optional[TranscriptDoc] = None
+        self._transcribe_current_name: str = ""
+        self._transcribe_current_progress: Optional[float] = None
+        self._transcribe_batch_n: int = 0
+        self._transcribe_current_i: int = 0
 
         # -- Build UI ------------------------------------------------------------
         self._build_toolbar()
@@ -170,6 +176,8 @@ class MainWindow(QMainWindow):
         self._status_combo.addItem("All", "")
         self._status_combo.addItem("✓ Transcribed", "transcribed")
         self._status_combo.addItem("⏳ Pending", "pending")
+        self._status_combo.addItem("⋯ Queued", "queued")
+        self._status_combo.addItem("▶ Transcribing", "transcribing")
         self._status_combo.addItem("✕ Duplicate", "duplicate")
         self._status_combo.currentIndexChanged.connect(self._on_status_filter_changed)
         toolbar.addWidget(self._status_combo)
@@ -213,6 +221,13 @@ class MainWindow(QMainWindow):
             header.setDefaultSectionSize(120)
             # Status column narrow
             header.resizeSection(0, 36)
+
+        try:
+            name_col = DISPLAY_COLUMNS.index("name")
+        except ValueError:
+            name_col = 1
+        self._table.setItemDelegateForColumn(name_col, NameProgressDelegate(self._table))
+        self._table.clicked.connect(self._on_table_clicked)
 
         self.setCentralWidget(self._table)
 
@@ -658,6 +673,19 @@ class MainWindow(QMainWindow):
         return sorted(rows)
 
 
+    def _visual_rows_to_df_indices(self, visual_rows: List[int]) -> List[int]:
+        indices: List[int] = []
+        for visual_row in visual_rows:
+            df_index = self._model.df_index_for_row(visual_row)
+            if df_index is not None:
+                indices.append(int(df_index))
+            ## END if df_index is not None....
+
+        ## END for visual_row in visual_rows....
+
+        return indices
+
+
     def _on_transcribe_selected(self) -> None:
         source_rows = self._get_selected_source_rows()
         if not source_rows:
@@ -666,7 +694,7 @@ class MainWindow(QMainWindow):
                 "Select one or more recordings to transcribe.",
             )
             return
-        self._start_transcription(source_rows)
+        self._start_transcription(self._visual_rows_to_df_indices(source_rows))
 
 
     def _on_transcribe_all_pending(self) -> None:
@@ -677,7 +705,7 @@ class MainWindow(QMainWindow):
 
         # Find pending rows (not transcribed, not duplicate)
         pending_mask = df["status"] == "pending"
-        pending_rows = list(df.index[pending_mask])
+        pending_rows = [int(i) for i in df.index[pending_mask]]
         if not pending_rows:
             QMessageBox.information(
                 self, "Nothing Pending",
@@ -696,12 +724,15 @@ class MainWindow(QMainWindow):
 
 
     def _start_transcription(self, source_rows: List[int]) -> None:
-        """Launch the TranscribeWorker for the given source model rows."""
+        """Launch the TranscribeWorker for the given DataFrame indices."""
         if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
             QMessageBox.warning(
                 self, "Already Running",
                 "A transcription is already in progress.",
             )
+            return
+
+        if not source_rows:
             return
 
         self._stop_transcript_discovery()
@@ -744,24 +775,120 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self._transcribe_worker.output_line.connect(self._on_transcribe_output)
+        self._transcribe_worker.file_started.connect(self._on_file_transcribe_started)
+        self._transcribe_worker.file_progress.connect(self._on_file_transcribe_progress)
         self._transcribe_worker.file_completed.connect(self._on_file_transcribed)
+        self._transcribe_worker.file_skipped.connect(self._on_file_transcribe_skipped)
+        self._transcribe_worker.file_failed.connect(self._on_file_transcribe_failed)
         self._transcribe_worker.all_done.connect(self._on_transcription_done)
         self._transcribe_worker.error.connect(self._on_transcription_error)
+
+        self._transcribe_batch_n = len(source_rows)
+        self._transcribe_current_i = 0
+        self._transcribe_current_name = ""
+        self._transcribe_current_progress = None
+        self._model.set_job_states(source_rows, "queued")
         self._transcribe_worker.start()
 
         self._transcribe_btn.setEnabled(False)
         self._transcribe_all_btn.setEnabled(False)
         self._cancel_transcribe_btn.setEnabled(True)
-        self._status_label.setText("Transcribing…")
+        self._status_label.setText(f"Transcribing 0/{self._transcribe_batch_n}…")
+
+
+    def _refresh_transcribe_status_bar(self) -> None:
+        n = self._transcribe_batch_n
+        i = self._transcribe_current_i
+        name = self._transcribe_current_name
+        progress = self._transcribe_current_progress
+        if name:
+            if isinstance(progress, float):
+                self._status_label.setText(
+                    f"Transcribing {i}/{n} — {name} {int(round(progress * 100))}%"
+                )
+            else:
+                self._status_label.setText(f"Transcribing {i}/{n} — {name}")
+        else:
+            self._status_label.setText(f"Transcribing {i}/{n}…")
+
+
+    def _on_file_transcribe_started(self, df_index: int, name: str, i: int, n: int) -> None:
+        self._transcribe_current_i = i
+        self._transcribe_batch_n = n
+        self._transcribe_current_name = name
+        self._transcribe_current_progress = None
+        job = self._model.job_state(df_index)
+        phase = "cancelling" if job and job.get("phase") == "cancelling" else "transcribing"
+        self._model.set_job_state(
+            df_index, phase, progress=None, position=i, total=n
+        )
+        self._refresh_transcribe_status_bar()
+
+
+    def _on_file_transcribe_progress(self, df_index: int, fraction: float) -> None:
+        self._transcribe_current_progress = fraction
+        job = self._model.job_state(df_index)
+        phase = "cancelling" if job and job.get("phase") == "cancelling" else "transcribing"
+        self._model.set_job_state(df_index, phase, progress=fraction)
+        self._refresh_transcribe_status_bar()
+
+
+    def _on_file_transcribe_skipped(self, df_index: int, reason: str) -> None:
+        had_job = self._model.job_state(df_index) is not None
+        self._model.clear_job_state(df_index)
+        if had_job:
+            self._log_text.appendPlainText(f"Skipped ({reason})")
+
+
+    def _on_file_transcribe_failed(self, df_index: int, message: str) -> None:
+        self._model.set_job_state(df_index, "failed", message=message)
+        self._log_text.appendPlainText(f"✗ Failed row {df_index}: {message}")
+
+
+    def _cancel_remaining_transcription(self) -> None:
+        """Finish the current file, skip the rest of the queue."""
+        if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
+            return
+        current = self._model.transcribing_df_index()
+        for df_index in self._model.queued_df_indices():
+            self._model.clear_job_state(df_index)
+        ## END for df_index in queued....
+
+        if current is not None:
+            self._model.set_job_state(current, "cancelling")
+        self._transcribe_worker.request_cancel()
+        self._cancel_transcribe_btn.setEnabled(False)
+        self._status_label.setText("Cancelling… finishing current file")
+
+
+    def _remove_queued_rows(self, df_indices: List[int]) -> None:
+        if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
+            return
+        removed = 0
+        for df_index in df_indices:
+            job = self._model.job_state(df_index)
+            if job is None:
+                continue
+            if job.get("phase") == "queued":
+                self._transcribe_worker.skip_row(df_index)
+                self._model.clear_job_state(df_index)
+                removed += 1
+            elif job.get("phase") in ("transcribing", "cancelling"):
+                self._cancel_remaining_transcription()
+                return
+            ## END if job phase....
+
+        ## END for df_index in df_indices....
+
+        if removed:
+            self._log_text.appendPlainText(
+                f"Removed {removed} recording(s) from the transcription queue"
+            )
 
 
     def _on_cancel_transcription(self) -> None:
         """Soft-stop the transcription queue after the current file finishes."""
-        if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
-            return
-        self._transcribe_worker.request_cancel()
-        self._cancel_transcribe_btn.setEnabled(False)
-        self._status_label.setText("Cancelling…")
+        self._cancel_remaining_transcription()
 
 
     def _on_transcribe_output(self, line: str) -> None:
@@ -782,7 +909,8 @@ class MainWindow(QMainWindow):
             proxy_index = selection.currentIndex()
             if proxy_index.isValid():
                 source_index = self._proxy.mapToSource(proxy_index)
-                if source_index.isValid() and source_index.row() == df_index:
+                selected_df_index = self._model.df_index_for_row(source_index.row())
+                if source_index.isValid() and selected_df_index == df_index:
                     row_data = self._model.get_row_data(source_index.row())
                     if row_data is not None:
                         self._update_transcript_preview(row_data)
@@ -793,17 +921,21 @@ class MainWindow(QMainWindow):
 
 
 
-    def _on_transcription_done(self, completed: int, failed: int) -> None:
+    def _on_transcription_done(self, completed: int, failed: int, cancelled: int = 0) -> None:
         self._transcribe_btn.setEnabled(True)
         self._transcribe_all_btn.setEnabled(True)
         self._cancel_transcribe_btn.setEnabled(False)
-        self._status_label.setText(
-            f"Transcription complete: {completed} succeeded, {failed} failed"
-        )
-        self._log_text.appendPlainText(
-            f"\n✓ Done — {completed} completed, {failed} failed"
-        )
-        self._update_status_bar()
+        self._model.clear_all_job_state()
+        self._transcribe_current_name = ""
+        self._transcribe_current_progress = None
+        parts = [f"{completed} succeeded"]
+        if failed:
+            parts.append(f"{failed} failed")
+        if cancelled:
+            parts.append(f"{cancelled} cancelled")
+        summary = ", ".join(parts)
+        self._status_label.setText(f"Transcription complete: {summary}")
+        self._log_text.appendPlainText(f"\n✓ Done — {summary}")
         self._auto_size_columns()
 
 
@@ -811,6 +943,7 @@ class MainWindow(QMainWindow):
         self._transcribe_btn.setEnabled(True)
         self._transcribe_all_btn.setEnabled(True)
         self._cancel_transcribe_btn.setEnabled(False)
+        self._model.clear_all_job_state()
         self._status_label.setText(f"Transcription error: {msg}")
         self._log_text.appendPlainText(f"\n✗ Error: {msg}")
         QMessageBox.critical(self, "Transcription Error", msg)
@@ -884,6 +1017,30 @@ class MainWindow(QMainWindow):
         self._play_row(row_data, source_index.row())
 
 
+    def _on_table_clicked(self, proxy_index) -> None:
+        """Click the status cell to dequeue or cancel remaining."""
+        if not proxy_index.isValid():
+            return
+        source_index = self._proxy.mapToSource(proxy_index)
+        if not source_index.isValid():
+            return
+        if self._model.column_name(source_index.column()) != "status":
+            return
+        df_index = self._model.df_index_for_row(source_index.row())
+        if df_index is None:
+            return
+        job = self._model.job_state(df_index)
+        if job is None:
+            return
+        phase = job.get("phase")
+        if phase == "queued":
+            self._remove_queued_rows([int(df_index)])
+        elif phase in ("transcribing", "cancelling"):
+            self._cancel_remaining_transcription()
+        ## END if phase....
+
+
+
     def _on_table_context_menu(self, pos) -> None:
         proxy_index = self._table.indexAt(pos)
         if not proxy_index.isValid():
@@ -908,11 +1065,32 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
-        # Transcribe this file
-        transcribe_action = menu.addAction("🎙 Transcribe This File")
-        transcribe_action.triggered.connect(
-            lambda: self._start_transcription([source_index.row()])
-        )
+        df_index = self._model.df_index_for_row(source_index.row())
+        job = self._model.job_state(df_index) if df_index is not None else None
+        job_phase = job.get("phase") if job else None
+
+        if job_phase == "queued" and df_index is not None:
+            remove_action = menu.addAction("✕ Remove from queue")
+            selected_queued = [
+                idx for idx in self._visual_rows_to_df_indices(self._get_selected_source_rows())
+                if (self._model.job_state(idx) or {}).get("phase") == "queued"
+            ]
+            targets = selected_queued if df_index in selected_queued and len(selected_queued) > 1 else [df_index]
+            remove_action.triggered.connect(
+                lambda _checked=False, rows=targets: self._remove_queued_rows(rows)
+            )
+        elif job_phase in ("transcribing", "cancelling"):
+            cancel_action = menu.addAction("⏹ Cancel remaining (finish this file)")
+            cancel_action.triggered.connect(self._cancel_remaining_transcription)
+        else:
+            # Transcribe this file
+            transcribe_action = menu.addAction("🎙 Transcribe This File")
+            transcribe_action.triggered.connect(
+                lambda: self._start_transcription(
+                    [df_index] if df_index is not None else []
+                )
+            )
+        ## END if job_phase....
 
         menu.addSeparator()
 

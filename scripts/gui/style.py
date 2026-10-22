@@ -10,19 +10,31 @@ from PyQt6.QtCore import Qt
 # -- Status colours -----------------------------------------------------------
 
 STATUS_COLORS = {
-    "transcribed": "#4ade80",   # green
-    "pending":     "#facc15",   # amber
-    "duplicate":   "#f87171",   # red
-    "playing":     "#60a5fa",   # blue
+    "transcribed":  "#4ade80",   # green
+    "pending":      "#facc15",   # amber
+    "duplicate":    "#f87171",   # red
+    "playing":      "#60a5fa",   # blue
+    "queued":       "#a78bfa",   # violet
+    "transcribing": "#7c5cfc",   # accent
+    "cancelling":   "#fb923c",   # orange
+    "failed":       "#f87171",   # red
 }
 
 # Background tints (lower opacity versions for row highlighting)
 ROW_TINTS = {
-    "transcribed": QColor(74, 222, 128, 28),
-    "pending":     QColor(250, 204, 21, 22),
-    "duplicate":   QColor(248, 113, 113, 32),
-    "playing":     QColor(96, 165, 250, 36),
+    "transcribed":  QColor(74, 222, 128, 28),
+    "pending":      QColor(250, 204, 21, 22),
+    "duplicate":    QColor(248, 113, 113, 32),
+    "playing":      QColor(96, 165, 250, 36),
+    "queued":       QColor(167, 139, 250, 32),
+    "transcribing": QColor(124, 92, 252, 48),
+    "cancelling":   QColor(251, 146, 60, 40),
+    "failed":       QColor(248, 113, 113, 44),
 }
+
+PROGRESS_FILL = QColor(124, 92, 252, 80)
+PROGRESS_TRACK = QColor(124, 92, 252, 28)
+PROGRESS_TEXT = QColor("#ddd6fe")
 
 # -- Palette ------------------------------------------------------------------
 
