@@ -8,6 +8,13 @@ from typing import Any, Dict, List
 
 from PyQt6.QtCore import QSettings
 
+from scripts.gui.idle import (
+    DEFAULT_IDLE_SECONDS,
+    DEFAULT_LOW_PRIORITY,
+    DEFAULT_RUN_WHEN,
+    normalize_idle_seconds,
+    normalize_run_when,
+)
 from whisper_timestamped.recording_formats.completeness import (
     default_watch_folders,
     normalize_watch_folders,
@@ -49,6 +56,19 @@ def _load_loaded_csvs(s: QSettings) -> Dict[str, Path]:
     return loaded_csvs
 
 
+def _coerce_bool(raw: Any, default: bool) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if not text:
+            return default
+        return text not in ("0", "false", "no")
+    ## END if raw is str....
+
+    return bool(raw)
+
+
 def _load_watch_folders(s: QSettings) -> List[Dict[str, Any]]:
     raw = s.value("watch/folders", "")
     parsed: Any = raw
@@ -68,12 +88,11 @@ def _load_watch_folders(s: QSettings) -> List[Dict[str, Any]]:
 def load_prefs() -> Dict[str, Any]:
     """Load path-related prefs. Drop loaded CSV paths that no longer exist."""
     s = _settings()
-    watch_enabled_raw = s.value("watch/enabled", True)
-    if isinstance(watch_enabled_raw, str):
-        watch_enabled = watch_enabled_raw.strip().lower() not in ("0", "false", "no")
-    else:
-        watch_enabled = bool(watch_enabled_raw)
-    ## END if watch_enabled_raw is str....
+    watch_enabled = _coerce_bool(s.value("watch/enabled", True), True)
+    watch_low_priority = _coerce_bool(
+        s.value("watch/low_priority", DEFAULT_LOW_PRIORITY),
+        DEFAULT_LOW_PRIORITY,
+    )
 
     hidden_raw = s.value("table/hidden_columns", "")
     hidden_columns: List[str] = []
@@ -109,6 +128,13 @@ def load_prefs() -> Dict[str, Any]:
         ),
         "watch_enabled": watch_enabled,
         "watch_folders": _load_watch_folders(s),
+        "watch_run_when": normalize_run_when(
+            s.value("watch/run_when", DEFAULT_RUN_WHEN)
+        ),
+        "watch_idle_seconds": normalize_idle_seconds(
+            s.value("watch/idle_seconds", DEFAULT_IDLE_SECONDS)
+        ),
+        "watch_low_priority": watch_low_priority,
         "hidden_columns": hidden_columns,
     }
 
@@ -138,6 +164,18 @@ def save_prefs(prefs: Dict[str, Any]) -> None:
         str(prefs.get("transcribe_crisper_mode", "verbatim") or "verbatim"),
     )
     s.setValue("watch/enabled", bool(prefs.get("watch_enabled", True)))
+    s.setValue(
+        "watch/run_when",
+        normalize_run_when(prefs.get("watch_run_when", DEFAULT_RUN_WHEN)),
+    )
+    s.setValue(
+        "watch/idle_seconds",
+        normalize_idle_seconds(prefs.get("watch_idle_seconds", DEFAULT_IDLE_SECONDS)),
+    )
+    s.setValue(
+        "watch/low_priority",
+        bool(prefs.get("watch_low_priority", DEFAULT_LOW_PRIORITY)),
+    )
     hidden_columns = [
         str(name) for name in (prefs.get("hidden_columns") or []) if name
     ]

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
-from PyQt6.QtCore import QItemSelectionModel, Qt, QTimer
+from PyQt6.QtCore import QItemSelectionModel, Qt, QThread, QTimer
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -58,6 +58,15 @@ from scripts.gui.dialogs import (
 )
 from scripts.gui.folder_watch import FolderWatchWorker
 from scripts.gui.discover_worker import DiscoverTranscriptsWorker
+from scripts.gui.idle import (
+    DEFAULT_IDLE_SECONDS,
+    DEFAULT_LOW_PRIORITY,
+    DEFAULT_RUN_WHEN,
+    is_user_idle,
+    last_input_idle_seconds,
+    leftover_queued_for_requeue,
+    should_start_auto,
+)
 from scripts.gui.preferences import load_prefs, save_prefs
 from scripts.gui.scan_worker import ScanWorker
 from scripts.gui.status_delegate import NameProgressDelegate
@@ -140,6 +149,7 @@ class MainWindow(QMainWindow):
         self._auto_queue: List[int] = []
         self._auto_queue_seen: Set[int] = set()
         self._transcribe_origin: str = ""
+        self._idle_paused: bool = False
         self._syncing_selection: bool = False
         self._calendar_refresh_pending: bool = False
 
@@ -161,6 +171,11 @@ class MainWindow(QMainWindow):
         self._ago_refresh_timer.setInterval(60_000)
         self._ago_refresh_timer.timeout.connect(self._model.refresh_ago_column)
         self._ago_refresh_timer.start()
+
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(5_000)
+        self._idle_timer.timeout.connect(self._on_idle_tick)
+        self._idle_timer.start()
 
 
     # ── Toolbar ──────────────────────────────────────────────────────────────
@@ -547,12 +562,22 @@ class MainWindow(QMainWindow):
         dlg = WatchFoldersDialog(
             self._prefs.get("watch_folders") or [],
             auto_transcribe=bool(self._prefs.get("watch_enabled", True)),
+            run_when=str(self._prefs.get("watch_run_when") or DEFAULT_RUN_WHEN),
+            idle_seconds=int(
+                self._prefs.get("watch_idle_seconds") or DEFAULT_IDLE_SECONDS
+            ),
+            low_priority=bool(
+                self._prefs.get("watch_low_priority", DEFAULT_LOW_PRIORITY)
+            ),
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._prefs["watch_folders"] = dlg.folders()
         self._prefs["watch_enabled"] = dlg.auto_transcribe()
+        self._prefs["watch_run_when"] = dlg.run_when()
+        self._prefs["watch_idle_seconds"] = dlg.idle_seconds()
+        self._prefs["watch_low_priority"] = dlg.low_priority()
         self._save_prefs()
         if self._tray is not None:
             self._tray.set_auto_transcribe(bool(self._prefs["watch_enabled"]))
@@ -680,10 +705,31 @@ class MainWindow(QMainWindow):
     def _drain_auto_queue(self) -> None:
         if not self._prefs.get("watch_enabled", True):
             return
-        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+        worker_running = (
+            self._transcribe_worker is not None
+            and self._transcribe_worker.isRunning()
+        )
+        if worker_running:
             return
         if not self._auto_queue:
             return
+        if not should_start_auto(
+            watch_enabled=True,
+            worker_running=False,
+            run_when=self._watch_run_when(),
+            idle_seconds=self._watch_idle_seconds(),
+            idle_for=last_input_idle_seconds(),
+        ):
+            self._update_tray_tooltip()
+            if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
+                n = len(self._auto_queue)
+                self._status_label.setText(
+                    f"Auto-transcribe waiting until idle ({n} queued)…"
+                )
+            ## END if not currently transcribing....
+
+            return
+        ## END if not should_start_auto....
         df = self._model.get_dataframe()
         pending: List[int] = []
         for df_index in self._auto_queue:
@@ -712,6 +758,74 @@ class MainWindow(QMainWindow):
         self._auto_queue = rest
         self._start_transcription(same, prompt=False, output_dir=first_out)
 
+    def _watch_run_when(self) -> str:
+        return str(self._prefs.get("watch_run_when") or DEFAULT_RUN_WHEN)
+
+    def _watch_idle_seconds(self) -> int:
+        return int(self._prefs.get("watch_idle_seconds") or DEFAULT_IDLE_SECONDS)
+
+    def _watch_low_priority(self) -> bool:
+        return bool(self._prefs.get("watch_low_priority", DEFAULT_LOW_PRIORITY))
+
+    def _is_waiting_for_idle(self) -> bool:
+        if not self._prefs.get("watch_enabled", True):
+            return False
+        if not self._auto_queue:
+            return False
+        worker_running = (
+            self._transcribe_worker is not None
+            and self._transcribe_worker.isRunning()
+        )
+        if worker_running:
+            return False
+        return not is_user_idle(
+            run_when=self._watch_run_when(),
+            idle_seconds=self._watch_idle_seconds(),
+            idle_for=last_input_idle_seconds(),
+        )
+
+    def _on_idle_tick(self) -> None:
+        worker_running = (
+            self._transcribe_worker is not None
+            and self._transcribe_worker.isRunning()
+        )
+        if (
+            worker_running
+            and self._transcribe_origin == "auto"
+            and not self._idle_paused
+            and not is_user_idle(
+                run_when=self._watch_run_when(),
+                idle_seconds=self._watch_idle_seconds(),
+                idle_for=last_input_idle_seconds(),
+            )
+        ):
+            self._idle_paused = True
+            if self._transcribe_worker is not None:
+                self._transcribe_worker.request_pause()
+            self._status_label.setText(
+                "Idle interrupted — finishing current file, then waiting…"
+            )
+            self._update_tray_tooltip()
+            return
+        ## END if auto worker should pause....
+
+        self._drain_auto_queue()
+        self._update_tray_tooltip()
+
+    def _requeue_leftover_auto_jobs(self) -> None:
+        leftover = leftover_queued_for_requeue(
+            origin=self._transcribe_origin,
+            paused=self._idle_paused,
+            queued_indices=self._model.queued_df_indices(),
+        )
+        for df_index in leftover:
+            if df_index not in self._auto_queue:
+                self._auto_queue.append(df_index)
+            self._auto_queue_seen.add(df_index)
+        ## END for df_index in leftover....
+
+        self._idle_paused = False
+
     def _update_tray_tooltip(self, watch_status: Optional[str] = None) -> None:
         if self._tray is None:
             return
@@ -735,6 +849,9 @@ class MainWindow(QMainWindow):
                 text = f"Transcribing {i}/{n}"
             ## END if name....
 
+        elif self._is_waiting_for_idle():
+            n_queued = len(self._auto_queue)
+            text = f"waiting for idle · {n_queued} queued"
         elif watch_status:
             text = f"{watch_status} · auto-transcribe {auto}"
         else:
@@ -1197,12 +1314,14 @@ class MainWindow(QMainWindow):
             self._prefs["transcribe_crisper_mode"] = crisper_mode
             self._save_prefs()
             self._transcribe_origin = "manual"
+            low_priority = False
         else:
             output_dir = Path(output_dir) if output_dir is not None else default_out
             backend = str(self._prefs.get("transcribe_backend") or "crisperwhisper")
             model_name = str(self._prefs.get("transcribe_model") or "turbo")
             crisper_mode = str(self._prefs.get("transcribe_crisper_mode") or "verbatim")
             self._transcribe_origin = "auto"
+            low_priority = self._watch_low_priority()
         ## END if prompt....
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1221,6 +1340,7 @@ class MainWindow(QMainWindow):
             backend=backend,
             model_name=model_name,
             crisper_mode=crisper_mode,
+            low_priority=low_priority,
             parent=self,
         )
         self._transcribe_worker.output_line.connect(self._on_transcribe_output)
@@ -1237,7 +1357,11 @@ class MainWindow(QMainWindow):
         self._transcribe_current_name = ""
         self._transcribe_current_progress = None
         self._model.set_job_states(source_rows, "queued")
+        self._idle_paused = False
         self._transcribe_worker.start()
+        if low_priority:
+            self._transcribe_worker.setPriority(QThread.Priority.LowestPriority)
+        ## END if low_priority....
 
         self._transcribe_btn.setEnabled(False)
         self._transcribe_all_btn.setEnabled(False)
@@ -1300,6 +1424,7 @@ class MainWindow(QMainWindow):
         """Finish the current file, skip the rest of the queue."""
         if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
             return
+        self._idle_paused = False
         current = self._model.transcribing_df_index()
         for df_index in self._model.queued_df_indices():
             self._model.clear_job_state(df_index)
@@ -1376,6 +1501,7 @@ class MainWindow(QMainWindow):
         self._transcribe_btn.setEnabled(True)
         self._transcribe_all_btn.setEnabled(True)
         self._cancel_transcribe_btn.setEnabled(False)
+        self._requeue_leftover_auto_jobs()
         self._model.clear_all_job_state()
         self._transcribe_current_name = ""
         self._transcribe_current_progress = None
@@ -1397,6 +1523,7 @@ class MainWindow(QMainWindow):
         self._transcribe_btn.setEnabled(True)
         self._transcribe_all_btn.setEnabled(True)
         self._cancel_transcribe_btn.setEnabled(False)
+        self._requeue_leftover_auto_jobs()
         self._model.clear_all_job_state()
         self._status_label.setText(f"Transcription error: {msg}")
         self._log_text.appendPlainText(f"\n✗ Error: {msg}")

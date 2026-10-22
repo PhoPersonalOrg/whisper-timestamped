@@ -10,19 +10,31 @@ from zoneinfo import ZoneInfo
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+)
+
+from scripts.gui.idle import (
+    DEFAULT_IDLE_SECONDS,
+    DEFAULT_LOW_PRIORITY,
+    DEFAULT_RUN_WHEN,
+    IDLE_SECONDS_CHOICES,
+    normalize_idle_seconds,
+    normalize_run_when,
 )
 
 from whisper_timestamped.recording_formats import (
@@ -310,17 +322,68 @@ class WatchFoldersDialog(QDialog):
         folders: Optional[List[Dict[str, Any]]] = None,
         *,
         auto_transcribe: bool = True,
+        run_when: str = DEFAULT_RUN_WHEN,
+        idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        low_priority: bool = DEFAULT_LOW_PRIORITY,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Watch Folders")
         self.setMinimumWidth(720)
-        self.setMinimumHeight(360)
+        self.setMinimumHeight(460)
 
         layout = QVBoxLayout(self)
         self._auto_cb = QCheckBox("Auto-transcribe completed recordings")
         self._auto_cb.setChecked(auto_transcribe)
+        self._auto_cb.toggled.connect(self._sync_background_enabled)
         layout.addWidget(self._auto_cb)
+
+        self._bg_group = QGroupBox("Background processing")
+        bg_layout = QVBoxLayout(self._bg_group)
+        self._run_when_group = QButtonGroup(self)
+        self._always_radio = QRadioButton("Whenever files are ready")
+        self._idle_radio = QRadioButton("When this computer is idle")
+        self._run_when_group.addButton(self._always_radio)
+        self._run_when_group.addButton(self._idle_radio)
+        bg_layout.addWidget(self._always_radio)
+        bg_layout.addWidget(self._idle_radio)
+        if normalize_run_when(run_when) == "always":
+            self._always_radio.setChecked(True)
+        else:
+            self._idle_radio.setChecked(True)
+        ## END if run_when is always....
+
+        idle_row = QHBoxLayout()
+        idle_row.addWidget(QLabel("Idle for:"))
+        self._idle_combo = QComboBox()
+        idle_labels = {
+            60: "1 minute",
+            120: "2 minutes",
+            300: "5 minutes",
+            600: "10 minutes",
+            900: "15 minutes",
+        }
+        chosen_idle = normalize_idle_seconds(idle_seconds)
+        for seconds in IDLE_SECONDS_CHOICES:
+            self._idle_combo.addItem(idle_labels[seconds], seconds)
+        ## END for seconds in IDLE_SECONDS_CHOICES....
+
+        idle_idx = self._idle_combo.findData(chosen_idle)
+        if idle_idx >= 0:
+            self._idle_combo.setCurrentIndex(idle_idx)
+        ## END if idle_idx >= 0....
+
+        idle_row.addWidget(self._idle_combo)
+        idle_row.addStretch()
+        bg_layout.addLayout(idle_row)
+
+        self._low_priority_cb = QCheckBox("Run auto-transcribe at low CPU priority")
+        self._low_priority_cb.setChecked(bool(low_priority))
+        bg_layout.addWidget(self._low_priority_cb)
+        self._idle_radio.toggled.connect(self._sync_idle_combo_enabled)
+        layout.addWidget(self._bg_group)
+        self._sync_background_enabled(self._auto_cb.isChecked())
+        self._sync_idle_combo_enabled(self._idle_radio.isChecked())
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(
@@ -426,8 +489,26 @@ class WatchFoldersDialog(QDialog):
             self._table.removeRow(row)
         ## END if row >= 0....
 
+    def _sync_background_enabled(self, enabled: bool) -> None:
+        self._bg_group.setEnabled(bool(enabled))
+
+    def _sync_idle_combo_enabled(self, idle_selected: bool) -> None:
+        self._idle_combo.setEnabled(bool(idle_selected))
+
     def auto_transcribe(self) -> bool:
         return self._auto_cb.isChecked()
+
+    def run_when(self) -> str:
+        if self._always_radio.isChecked():
+            return "always"
+        return DEFAULT_RUN_WHEN
+
+    def idle_seconds(self) -> int:
+        data = self._idle_combo.currentData()
+        return normalize_idle_seconds(data if data is not None else DEFAULT_IDLE_SECONDS)
+
+    def low_priority(self) -> bool:
+        return self._low_priority_cb.isChecked()
 
     def folders(self) -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []

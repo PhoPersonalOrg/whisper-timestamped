@@ -16,6 +16,7 @@ from typing import Optional, Set
 import pandas as pd
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from scripts.gui.idle import apply_current_thread_low_priority
 from scripts.transcribe_queue import ARM_DF_INDEX_COL, coerce_row_index
 
 
@@ -53,7 +54,17 @@ class TranscribeWorker(QThread):
     all_done = pyqtSignal(int, int, int)           # (completed, failed, cancelled)
     error = pyqtSignal(str)
 
-    def __init__(self, rows_df: pd.DataFrame, output_dir: Path, backend: str = "crisperwhisper", model_name: str = "turbo", crisper_mode: str = "verbatim", crisper_runtime: str = "auto", parent=None) -> None:
+    def __init__(
+        self,
+        rows_df: pd.DataFrame,
+        output_dir: Path,
+        backend: str = "crisperwhisper",
+        model_name: str = "turbo",
+        crisper_mode: str = "verbatim",
+        crisper_runtime: str = "auto",
+        low_priority: bool = False,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.rows_df = rows_df.copy()
         self.rows_df[ARM_DF_INDEX_COL] = [int(i) for i in self.rows_df.index]
@@ -62,7 +73,9 @@ class TranscribeWorker(QThread):
         self.model_name = model_name
         self.crisper_mode = crisper_mode
         self.crisper_runtime = crisper_runtime
+        self.low_priority = bool(low_priority)
         self._cancel_requested = False
+        self._pause_requested = False
         self._interrupt = None  # set in run() after lazy import
         self._skipped_indices: Set[int] = set()
         self._current_df_index: Optional[int] = None
@@ -81,9 +94,24 @@ class TranscribeWorker(QThread):
             self._interrupt.skip_indices.add(idx)
 
 
+    def request_pause(self) -> None:
+        """Finish the current file, then stop without cancelling remaining rows."""
+        if self._cancel_requested:
+            return
+        self._pause_requested = True
+        if self._interrupt is not None:
+            self._interrupt.stop_after_current = True
+        ## END if self._interrupt is not None....
+
+        self.output_line.emit(
+            "User activity — finishing current file, then waiting for idle…"
+        )
+
+
     def request_cancel(self) -> None:
         """Request a soft-stop after the current file finishes."""
         self._cancel_requested = True
+        self._pause_requested = False
         remaining = [
             int(i) for i in self.rows_df.index
             if self._current_df_index is None or int(i) != self._current_df_index
@@ -159,9 +187,29 @@ class TranscribeWorker(QThread):
 
             self._interrupt = _GracefulInterruptState()
             self._interrupt.skip_indices.update(self._skipped_indices)
-            if self._cancel_requested:
+            if self._cancel_requested or self._pause_requested:
                 self._interrupt.stop_after_current = True
-            ## END if self._cancel_requested....
+            ## END if self._cancel_requested or self._pause_requested....
+
+            prev_threads = None
+            if self.low_priority:
+                apply_current_thread_low_priority()
+                try:
+                    import torch
+
+                    prev_threads = int(torch.get_num_threads())
+                    torch.set_num_threads(1)
+                    try:
+                        torch.set_num_interop_threads(1)
+                    except RuntimeError:
+                        pass
+                    ## END try set_num_interop_threads....
+
+                except Exception:
+                    prev_threads = None
+                ## END try torch thread cap....
+
+            ## END if self.low_priority....
 
             # Write selected rows to a temporary filelist CSV
             tmp = tempfile.NamedTemporaryFile(
@@ -200,6 +248,17 @@ class TranscribeWorker(QThread):
             finally:
                 sys.stdout = old_stdout
                 writer.flush()
+                if prev_threads is not None:
+                    try:
+                        import torch
+
+                        torch.set_num_threads(prev_threads)
+                    except Exception:
+                        pass
+                    ## END try restore torch threads....
+
+                ## END if prev_threads is not None....
+
             ## END try redirect stdout...
 
             # Clean up temp CSV
