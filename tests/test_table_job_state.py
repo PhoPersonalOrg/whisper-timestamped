@@ -24,6 +24,7 @@ from scripts.gui.table_model import (
     RecordingTableModel,
     compute_status,
     format_created_ago,
+    format_created_display,
 )
 
 
@@ -166,6 +167,18 @@ class TestCreatedColumnSort(unittest.TestCase):
         names = _proxy_names(self._sorted_proxy(Qt.SortOrder.AscendingOrder))
         self.assertEqual(names[:3], ["old", "mid", "newest"])
         self.assertEqual(set(names[3:]), {"empty", "bad"})
+
+
+class TestFormatCreatedDisplay(unittest.TestCase):
+    def test_iso_date_weekday_and_12h_time(self):
+        self.assertEqual(
+            format_created_display("2026-10-07 16:56:00"),
+            "2026-10-07 (Wed) 4:56pm",
+        )
+
+    def test_empty_and_unparseable_are_blank(self):
+        self.assertEqual(format_created_display(""), "")
+        self.assertEqual(format_created_display("not-a-date"), "")
 
 
 class TestFormatCreatedAgo(unittest.TestCase):

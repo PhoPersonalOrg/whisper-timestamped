@@ -75,6 +75,23 @@ def load_prefs() -> Dict[str, Any]:
         watch_enabled = bool(watch_enabled_raw)
     ## END if watch_enabled_raw is str....
 
+    hidden_raw = s.value("table/hidden_columns", "")
+    hidden_columns: List[str] = []
+    if isinstance(hidden_raw, list):
+        hidden_columns = [str(name) for name in hidden_raw if name]
+    elif isinstance(hidden_raw, str) and hidden_raw.strip():
+        try:
+            parsed_hidden = json.loads(hidden_raw)
+            if isinstance(parsed_hidden, list):
+                hidden_columns = [str(name) for name in parsed_hidden if name]
+            ## END if parsed_hidden is list....
+
+        except json.JSONDecodeError:
+            hidden_columns = []
+        ## END try json.loads....
+
+    ## END if hidden_raw type....
+
     return {
         "scan_audio_dir": str(s.value("scan/audio_dir", "") or ""),
         "scan_format_id": str(s.value("scan/format_id", "") or ""),
@@ -92,6 +109,7 @@ def load_prefs() -> Dict[str, Any]:
         ),
         "watch_enabled": watch_enabled,
         "watch_folders": _load_watch_folders(s),
+        "hidden_columns": hidden_columns,
     }
 
 
@@ -120,6 +138,10 @@ def save_prefs(prefs: Dict[str, Any]) -> None:
         str(prefs.get("transcribe_crisper_mode", "verbatim") or "verbatim"),
     )
     s.setValue("watch/enabled", bool(prefs.get("watch_enabled", True)))
+    hidden_columns = [
+        str(name) for name in (prefs.get("hidden_columns") or []) if name
+    ]
+    s.setValue("table/hidden_columns", json.dumps(hidden_columns))
     s.setValue(
         "watch/folders",
         json.dumps(normalize_watch_folders(prefs.get("watch_folders") or [])),

@@ -53,19 +53,15 @@ def parse_created_datetime(value: Any) -> Optional[datetime]:
 
 
 def format_created_display(value: Any) -> str:
-    """12-hour local datetime, e.g. ``Oct 20, 7:14am``."""
+    """Local datetime, e.g. ``2026-10-07 (Wed) 4:56pm``."""
     dt = parse_created_datetime(value)
     if dt is None:
         return ""
     hour = dt.strftime("%I").lstrip("0") or "12"
     minute = dt.strftime("%M")
     ampm = dt.strftime("%p").lower()
-    date_part = dt.strftime("%b %d").replace(" 0", " ")
-    if dt.year != datetime.now().year:
-        date_part = f"{date_part}, {dt.year}"
-    ## END if dt.year != datetime.now().year....
-
-    return f"{date_part}, {hour}:{minute}{ampm}"
+    weekday = dt.strftime("%a")
+    return f"{dt.strftime('%Y-%m-%d')} ({weekday}) {hour}:{minute}{ampm}"
 
 
 def format_created_ago(value: Any, now: Optional[datetime] = None) -> str:

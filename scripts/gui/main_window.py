@@ -57,6 +57,7 @@ from scripts.gui.preferences import load_prefs, save_prefs
 from scripts.gui.scan_worker import ScanWorker
 from scripts.gui.status_delegate import NameProgressDelegate
 from scripts.gui.table_model import (
+    COLUMN_HEADERS,
     DISPLAY_COLUMNS,
     RecordingFilterProxy,
     RecordingTableModel,
@@ -255,6 +256,8 @@ class MainWindow(QMainWindow):
             header.setDefaultSectionSize(120)
             # Status column narrow
             header.resizeSection(0, 36)
+            header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            header.customContextMenuRequested.connect(self._on_header_context_menu)
 
         try:
             name_col = DISPLAY_COLUMNS.index("name")
@@ -427,6 +430,7 @@ class MainWindow(QMainWindow):
         """Apply persisted paths: reload last filelists into the table."""
         loaded = self._prefs.get("loaded_csvs") or {}
         self._loaded_csvs = dict(loaded)
+        self._apply_hidden_columns()
         if self._loaded_csvs:
             self._reload_merged_data()
             names = ", ".join(p.name for p in self._loaded_csvs.values())
@@ -440,6 +444,7 @@ class MainWindow(QMainWindow):
     def _save_prefs(self) -> None:
         """Persist current path/filelist preferences."""
         self._prefs["loaded_csvs"] = dict(self._loaded_csvs)
+        self._prefs["hidden_columns"] = self._hidden_column_names()
         save_prefs(self._prefs)
 
 
@@ -962,6 +967,73 @@ class MainWindow(QMainWindow):
                 header.resizeSection(col, new_width)
             ## END for col in range(1, self._model.columnCount())...
 
+        self._apply_hidden_columns()
+
+
+    def _hidden_column_names(self) -> List[str]:
+        """Return currently hidden display-column ids."""
+        hidden: List[str] = []
+        for col, name in enumerate(DISPLAY_COLUMNS):
+            if self._table.isColumnHidden(col):
+                hidden.append(name)
+            ## END if hidden....
+
+        ## END for col, name in enumerate....
+
+        return hidden
+
+
+    def _apply_hidden_columns(self) -> None:
+        """Hide columns listed in prefs; Name and Status stay visible."""
+        hidden = {
+            str(name)
+            for name in (self._prefs.get("hidden_columns") or [])
+            if name
+        }
+        for col, name in enumerate(DISPLAY_COLUMNS):
+            if name in ("status", "name"):
+                self._table.setColumnHidden(col, False)
+                continue
+            self._table.setColumnHidden(col, name in hidden)
+        ## END for col, name in enumerate....
+
+
+    def _set_column_visible(self, col_name: str, visible: bool) -> None:
+        if col_name in ("status", "name"):
+            return
+        try:
+            col = DISPLAY_COLUMNS.index(col_name)
+        except ValueError:
+            return
+        self._table.setColumnHidden(col, not visible)
+        self._prefs["hidden_columns"] = self._hidden_column_names()
+        self._save_prefs()
+
+
+    def _on_header_context_menu(self, pos) -> None:
+        """Right-click column headers to show/hide optional columns."""
+        header = self._table.horizontalHeader()
+        if header is None:
+            return
+        menu = QMenu(self)
+        for col, name in enumerate(DISPLAY_COLUMNS):
+            label = COLUMN_HEADERS.get(name, name)
+            if not label:
+                continue
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not self._table.isColumnHidden(col))
+            if name in ("status", "name"):
+                action.setEnabled(False)
+            else:
+                action.triggered.connect(
+                    lambda checked, n=name: self._set_column_visible(n, checked)
+                )
+            ## END if always-visible....
+
+        ## END for col, name in enumerate....
+
+        menu.exec(header.mapToGlobal(pos))
 
 
     # -- Transcription ---------------------------------------------------------
