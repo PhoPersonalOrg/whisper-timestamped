@@ -143,6 +143,34 @@ class RecordingsFormat(ABC):
 
         return sorted(paths)
 
+    def build_filelist_row(
+        self,
+        path: Path,
+        tz_name: str = "America/Los_Angeles",
+    ) -> Dict[str, Any]:
+        """Build one filelist row dict for *path*."""
+        st = path.stat()
+        size_bytes = int(st.st_size)
+        creation = self.extract_creation_time(path, tz_name=tz_name)
+        if creation is None:
+            creation = _fs_timestamp_to_local_str(
+                _birth_time_epoch(st), tz_name
+            )
+        ## END if creation is None....
+
+        row: Dict[str, Any] = {
+            "name": self.transcript_name(path),
+            "size_bytes": size_bytes,
+            "size_mb": f"{size_bytes / 1_048_576:.3f}",
+            "creation_time": creation,
+            "modification_time": _fs_timestamp_to_local_str(
+                st.st_mtime, tz_name
+            ),
+            "full_path": str(path),
+        }
+        row.update(self.extra_row_fields(path))
+        return row
+
     def build_filelist_rows(
         self,
         recordings_dir: Path,
@@ -151,25 +179,36 @@ class RecordingsFormat(ABC):
         """Build filelist row dicts for media under *recordings_dir*."""
         rows: List[Dict[str, Any]] = []
         for path in self.discover_media(recordings_dir):
-            st = path.stat()
-            size_bytes = int(st.st_size)
-            row: Dict[str, Any] = {
-                "name": self.transcript_name(path),
-                "size_bytes": size_bytes,
-                "size_mb": f"{size_bytes / 1_048_576:.3f}",
-                "creation_time": _fs_timestamp_to_local_str(
-                    _birth_time_epoch(st), tz_name
-                ),
-                "modification_time": _fs_timestamp_to_local_str(
-                    st.st_mtime, tz_name
-                ),
-                "full_path": str(path),
-            }
-            row.update(self.extra_row_fields(path))
-            rows.append(row)
+            rows.append(self.build_filelist_row(path, tz_name=tz_name))
         ## END for path in self.discover_media(recordings_dir)....
 
         return rows
+
+    def resolve_watch_filelist_csv(
+        self,
+        recordings_dir: Optional[Path] = None,
+    ) -> Path:
+        """Newest or today's filelist CSV, even when the format has no default dir."""
+        if self.default_filelists_dir is not None:
+            return self.resolve_filelist_csv()
+        root = Path(recordings_dir) if recordings_dir is not None else Path(
+            self.default_recordings_dir
+        )
+        directory = root / "filelists"
+        if directory.is_dir():
+            candidates = sorted(
+                directory.glob("*file_list*.csv"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0]
+            ## END if candidates....
+
+        ## END if directory.is_dir()....
+
+        day = datetime.now().strftime("%Y-%m-%d")
+        return directory / f"{day}_{self.filelist_name_prefix}_file_list.csv"
 
     def default_filelist_csv_path(
         self,

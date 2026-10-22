@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from PyQt6.QtCore import QSettings
+
+from whisper_timestamped.recording_formats.completeness import (
+    default_watch_folders,
+    normalize_watch_folders,
+)
 
 
 def _settings() -> QSettings:
@@ -27,6 +32,9 @@ def _load_loaded_csvs(s: QSettings) -> Dict[str, Path]:
                 mapping = parsed
         except json.JSONDecodeError:
             mapping = {}
+        ## END try json.loads....
+
+    ## END if raw type....
 
     for format_id, path_str in mapping.items():
         if not format_id or not path_str:
@@ -34,14 +42,39 @@ def _load_loaded_csvs(s: QSettings) -> Dict[str, Path]:
         path = Path(str(path_str))
         if path.is_file():
             loaded_csvs[str(format_id)] = path
+        ## END if path.is_file()....
+
     ## END for format_id, path_str in mapping.items()....
 
     return loaded_csvs
 
 
+def _load_watch_folders(s: QSettings) -> List[Dict[str, Any]]:
+    raw = s.value("watch/folders", "")
+    parsed: Any = raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = []
+        ## END try json.loads....
+
+    folders = normalize_watch_folders(parsed)
+    if folders:
+        return folders
+    return default_watch_folders()
+
+
 def load_prefs() -> Dict[str, Any]:
     """Load path-related prefs. Drop loaded CSV paths that no longer exist."""
     s = _settings()
+    watch_enabled_raw = s.value("watch/enabled", True)
+    if isinstance(watch_enabled_raw, str):
+        watch_enabled = watch_enabled_raw.strip().lower() not in ("0", "false", "no")
+    else:
+        watch_enabled = bool(watch_enabled_raw)
+    ## END if watch_enabled_raw is str....
+
     return {
         "scan_audio_dir": str(s.value("scan/audio_dir", "") or ""),
         "scan_format_id": str(s.value("scan/format_id", "") or ""),
@@ -50,6 +83,15 @@ def load_prefs() -> Dict[str, Any]:
         "loaded_csvs": _load_loaded_csvs(s),
         "browse_load_csv_dir": str(s.value("browse/load_csv_dir", "") or ""),
         "transcribe_output_dir": str(s.value("transcribe/output_dir", "") or ""),
+        "transcribe_backend": str(
+            s.value("transcribe/backend", "crisperwhisper") or "crisperwhisper"
+        ),
+        "transcribe_model": str(s.value("transcribe/model", "turbo") or "turbo"),
+        "transcribe_crisper_mode": str(
+            s.value("transcribe/crisper_mode", "verbatim") or "verbatim"
+        ),
+        "watch_enabled": watch_enabled,
+        "watch_folders": _load_watch_folders(s),
     }
 
 
@@ -64,6 +106,23 @@ def save_prefs(prefs: Dict[str, Any]) -> None:
     s.setValue(
         "transcribe/output_dir",
         str(prefs.get("transcribe_output_dir", "") or ""),
+    )
+    s.setValue(
+        "transcribe/backend",
+        str(prefs.get("transcribe_backend", "crisperwhisper") or "crisperwhisper"),
+    )
+    s.setValue(
+        "transcribe/model",
+        str(prefs.get("transcribe_model", "turbo") or "turbo"),
+    )
+    s.setValue(
+        "transcribe/crisper_mode",
+        str(prefs.get("transcribe_crisper_mode", "verbatim") or "verbatim"),
+    )
+    s.setValue("watch/enabled", bool(prefs.get("watch_enabled", True)))
+    s.setValue(
+        "watch/folders",
+        json.dumps(normalize_watch_folders(prefs.get("watch_folders") or [])),
     )
 
     loaded = prefs.get("loaded_csvs") or {}

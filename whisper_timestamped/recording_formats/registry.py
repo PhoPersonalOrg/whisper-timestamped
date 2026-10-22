@@ -75,5 +75,10 @@ def detect_format(path: Path) -> Optional[RecordingsFormat]:
     return None
 
 
+def list_canonical_formats() -> List[RecordingsFormat]:
+    """Formats used for detect/watch (aliases like ``rec_continuous`` omitted)."""
+    return list(_DETECT_ORDER)
+
+
 def list_format_ids() -> List[str]:
     return sorted(FORMATS.keys())

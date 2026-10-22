@@ -305,6 +305,39 @@ class RecordingTableModel(QAbstractTableModel):
         return self._job_state.get(df_index)
 
 
+    def upsert_row(self, row: Dict[str, Any]) -> int:
+        """Insert or update a row keyed by ``full_path``. Returns the DataFrame index."""
+        full_path = str(row.get("full_path") or "")
+        if full_path and "full_path" in self._df.columns and not self._df.empty:
+            mask = self._df["full_path"].astype(str) == full_path
+            if bool(mask.any()):
+                idx = int(self._df.index[mask][0])
+                self.update_row(idx, row)
+                return idx
+            ## END if mask.any()....
+
+        ## END if matching full_path....
+
+        for col in list(row.keys()) + list(self._columns):
+            if col not in self._df.columns:
+                self._df[col] = ""
+            ## END if col not in self._df.columns....
+
+        ## END for col in list(row.keys())....
+
+        ensure_transcript_status_columns(self._df)
+        new_index = 0 if self._df.empty else int(self._df.index.max()) + 1
+        values: Dict[str, Any] = {col: "" for col in self._df.columns}
+        values.update(row)
+        visual = len(self._df)
+        self.beginInsertRows(QModelIndex(), visual, visual)
+        self._df.loc[new_index] = values
+        self._df.at[new_index, "status"] = compute_status(self._df.loc[new_index])
+        self.endInsertRows()
+        self.data_changed_signal.emit()
+        return new_index
+
+
     def update_row(self, df_index: int, updates: Dict[str, Any]) -> None:
         """Update specific cells in a row by DataFrame index."""
         if df_index not in self._df.index:
@@ -596,11 +629,27 @@ class RecordingFilterProxy(QSortFilterProxyModel):
 
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        """Sort Created by the original timestamp, not the 12-hour display string."""
+        """Sort Created by the original timestamp, not the 12-hour display string.
+
+        Empty / unparseable dates always sort after real timestamps, in both
+        ascending (oldest first) and descending (newest first) order.
+        """
         model = self.sourceModel()
         if isinstance(model, RecordingTableModel) and model.column_name(left.column()) == "extracted_creation_time":
             left_key = model.data(left, Qt.ItemDataRole.UserRole) or ""
             right_key = model.data(right, Qt.ItemDataRole.UserRole) or ""
+            left_empty = not left_key
+            right_empty = not right_key
+            if left_empty or right_empty:
+                if left_empty and right_empty:
+                    return False
+                # Qt swaps the operands when sorting descending, so invert
+                # the empty comparison to keep blanks at the bottom either way.
+                if self.sortOrder() == Qt.SortOrder.AscendingOrder:
+                    return not left_empty
+                return left_empty
+            ## END if left_empty or right_empty....
+
             return left_key < right_key
         ## END if created column....
 

@@ -55,3 +55,15 @@ uv run --extra gui whisper_timestamped_gui
 # equivalent:
 uv run --extra gui python -m scripts.gui
 ```
+
+### Single-file Windows executable
+
+Double-click `Build GUI.exe.bat`, or from a terminal:
+
+```bash
+uv run --extra gui python scripts/build_gui_exe.py
+```
+
+That writes `dist/whisper_timestamped_gui.exe` (one file, console window kept so startup and transcribe errors stay visible). First unpack on launch is slow, and with CUDA PyTorch the exe is typically several GB.
+
+`ffmpeg` / `ffprobe` must still be on PATH (scan, playback fallback, and decode). Whisper / Hugging Face weights are **not** bundled; they download into the user cache on first transcribe.

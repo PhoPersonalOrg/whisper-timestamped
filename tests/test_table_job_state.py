@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.gui.table_model import (
+    DISPLAY_COLUMNS,
     JOB_PHASE_ROLE,
     PENDING_LIKE_STATUSES,
     PROGRESS_ROLE,
@@ -101,6 +103,67 @@ class TestJobStateOverlay(unittest.TestCase):
         self.assertIn("queued", PENDING_LIKE_STATUSES)
         self.assertGreaterEqual(proxy.rowCount(), 2)
         self.assertTrue("queued" in statuses or "transcribing" in statuses)
+
+
+def _created_sort_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "name": ["old", "empty", "newest", "bad", "mid"],
+            "full_path": [
+                "/tmp/old.mkv",
+                "/tmp/empty.mkv",
+                "/tmp/newest.mkv",
+                "/tmp/bad.mkv",
+                "/tmp/mid.mkv",
+            ],
+            "format_id": ["rec"] * 5,
+            "title": ["old", "empty", "newest", "bad", "mid"],
+            "size_mb": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "duration_hms": ["00:01:00"] * 5,
+            "extracted_creation_time": [
+                "2024-01-01 00:00:00",
+                "",
+                "2026-10-20 07:14:00",
+                "not-a-date",
+                "2025-06-15 12:00:00",
+            ],
+            "is_duplicate": [False] * 5,
+            "transcript_txt": [""] * 5,
+        }
+    )
+
+
+def _proxy_names(proxy: RecordingFilterProxy) -> list[str]:
+    name_col = DISPLAY_COLUMNS.index("name")
+    return [
+        str(proxy.data(proxy.index(row, name_col)) or "")
+        for row in range(proxy.rowCount())
+    ]
+
+
+class TestCreatedColumnSort(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = _app()
+
+    def _sorted_proxy(self, order: Qt.SortOrder) -> RecordingFilterProxy:
+        model = RecordingTableModel()
+        model.set_dataframe(_created_sort_df())
+        proxy = RecordingFilterProxy()
+        proxy.setSourceModel(model)
+        created_col = DISPLAY_COLUMNS.index("extracted_creation_time")
+        proxy.sort(created_col, order)
+        return proxy
+
+    def test_descending_puts_newest_first_and_empty_last(self):
+        names = _proxy_names(self._sorted_proxy(Qt.SortOrder.DescendingOrder))
+        self.assertEqual(names[:3], ["newest", "mid", "old"])
+        self.assertEqual(set(names[3:]), {"empty", "bad"})
+
+    def test_ascending_puts_oldest_first_and_empty_last(self):
+        names = _proxy_names(self._sorted_proxy(Qt.SortOrder.AscendingOrder))
+        self.assertEqual(names[:3], ["old", "mid", "newest"])
+        self.assertEqual(set(names[3:]), {"empty", "bad"})
 
 
 if __name__ == "__main__":

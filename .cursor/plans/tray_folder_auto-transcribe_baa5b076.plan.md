@@ -4,22 +4,22 @@ overview: Run the existing Audio Recording Manager as a single-instance tray app
 todos:
   - id: completeness-helpers
     content: Extract non-blocking completeness checks (CAM sidecar stop fields + size/mtime) and reuse them from watcher.py
-    status: in_progress
+    status: completed
   - id: watch-worker
     content: Add watchdog FolderWatchWorker with debounce, per-format extensions, nest_one_level recursion, and pending re-check
-    status: pending
+    status: completed
   - id: auto-queue
     content: Upsert filelist rows and auto-start TranscribeWorker when idle using persisted backend/model; wait if a manual batch is running
-    status: pending
+    status: completed
   - id: tray-lifecycle
     content: QSystemTrayIcon, hide-on-close, right-click shows GUI, single-instance, --hidden, Start with Windows, watchdog in gui extra
-    status: pending
+    status: completed
   - id: prefs-dialog
     content: Persist watch folder list + transcribe settings; Watch folders dialog seeded from format default dirs
-    status: pending
+    status: completed
   - id: tests
     content: Unit tests for CAM sidecar completeness, stability, skip rules, and default watch-folder seeding
-    status: pending
+    status: completed
 isProject: false
 ---
 

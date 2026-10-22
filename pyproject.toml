@@ -61,6 +61,8 @@ dev = [
 ]
 gui = [
     "PyQt6>=6.6.0",
+    "sounddevice>=0.4.6",
+    "watchdog>=4.0.0",
 ]
 live = [
     "faster-whisper>=1.0.0",

@@ -6,13 +6,11 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from whisper_timestamped.recording_formats.base import (
     RecordingsFormat,
     utc_to_local_str,
-    _fs_timestamp_to_local_str,
-    _birth_time_epoch,
 )
 
 _CAM_RE = re.compile(
@@ -141,37 +139,6 @@ class RecContinuousVideoRecorderFormat(RecordingsFormat):
         ## END if lsl_local_clock_start....
         return fields
 
-    def build_filelist_rows(
-        self,
-        recordings_dir: Path,
-        tz_name: str = "America/Los_Angeles",
-    ) -> List[Dict[str, Any]]:
-        """Build filelist rows; prefer format creation time over FS birth time."""
-        rows: List[Dict[str, Any]] = []
-        for path in self.discover_media(recordings_dir):
-            st = path.stat()
-            size_bytes = int(st.st_size)
-            creation = self.extract_creation_time(path, tz_name=tz_name)
-            if creation is None:
-                creation = _fs_timestamp_to_local_str(
-                    _birth_time_epoch(st), tz_name
-                )
-            ## END if creation is None....
-            row: Dict[str, Any] = {
-                "name": self.transcript_name(path),
-                "size_bytes": size_bytes,
-                "size_mb": f"{size_bytes / 1_048_576:.3f}",
-                "creation_time": creation,
-                "modification_time": _fs_timestamp_to_local_str(
-                    st.st_mtime, tz_name
-                ),
-                "full_path": str(path),
-            }
-            row.update(self.extra_row_fields(path))
-            rows.append(row)
-        ## END for path in self.discover_media(recordings_dir)....
-
-        return rows
 
 
 class RecContinuousFormat(RecContinuousVideoRecorderFormat):

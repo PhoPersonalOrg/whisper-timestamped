@@ -4857,6 +4857,8 @@ full = [
 ]
 gui = [
     { name = "pyqt6" },
+    { name = "sounddevice" },
+    { name = "watchdog" },
 ]
 live = [
     { name = "faster-whisper" },
@@ -4925,6 +4927,7 @@ requires-dist = [
     { name = "setuptools", specifier = ">=80.9.0,<81" },
     { name = "silero-vad", specifier = ">=6.0.0" },
     { name = "sounddevice", marker = "extra == 'full'", specifier = ">=0.4.6" },
+    { name = "sounddevice", marker = "extra == 'gui'", specifier = ">=0.4.6" },
     { name = "sounddevice", marker = "extra == 'live'", specifier = ">=0.4.6" },
     { name = "soundfile", specifier = ">=0.12.1" },
     { name = "soundfile", marker = "extra == 'full'", specifier = ">=0.12.1" },
@@ -4944,6 +4947,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'dev'", specifier = ">=4.53.2" },
     { name = "transformers", marker = "extra == 'full'", specifier = ">=4.53.2" },
     { name = "watchdog", marker = "extra == 'full'", specifier = ">=4.0.0" },
+    { name = "watchdog", marker = "extra == 'gui'", specifier = ">=4.0.0" },
     { name = "watchdog", marker = "extra == 'watch'", specifier = ">=4.0.0" },
     { name = "wheel", specifier = ">=0.45.1" },
 ]

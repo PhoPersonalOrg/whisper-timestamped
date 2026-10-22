@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 from PyQt6.QtCore import Qt, QTimer
@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QStatusBar,
+    QSystemTrayIcon,
     QTableView,
     QTextEdit,
     QToolBar,
@@ -44,7 +45,13 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.gui.audio_player import AudioPlayer
-from scripts.gui.dialogs import ScanConfigDialog, TranscribeConfigDialog
+from scripts.gui.autostart import is_start_with_windows, set_start_with_windows
+from scripts.gui.dialogs import (
+    ScanConfigDialog,
+    TranscribeConfigDialog,
+    WatchFoldersDialog,
+)
+from scripts.gui.folder_watch import FolderWatchWorker
 from scripts.gui.discover_worker import DiscoverTranscriptsWorker
 from scripts.gui.preferences import load_prefs, save_prefs
 from scripts.gui.scan_worker import ScanWorker
@@ -65,10 +72,18 @@ from scripts.gui.transcript_format import (
 )
 from scripts.gui.transcript_viewer import TranscriptViewerDialog
 from scripts.gui.transcribe_worker import TranscribeWorker
+from scripts.gui.tray import TrayController
 from scripts.transcript_outputs import (
     csv_derived_output_dir,
+    find_extant_output_files,
+    has_transcript_path_values,
     transcript_status_columns,
 )
+from whisper_timestamped.recording_formats.completeness import (
+    output_dir_for_format,
+    upsert_filelist_csv_row,
+)
+from whisper_timestamped.recording_formats.registry import get_format
 
 from scripts.iOSWhisperAppHelpers.extract_m4a_creation_times import (
     move_duplicates_to_dup_dir,
@@ -113,6 +128,12 @@ class MainWindow(QMainWindow):
         self._transcribe_current_progress: Optional[float] = None
         self._transcribe_batch_n: int = 0
         self._transcribe_current_i: int = 0
+        self._force_quit: bool = False
+        self._tray: Optional[TrayController] = None
+        self._watch_worker: Optional[FolderWatchWorker] = None
+        self._auto_queue: List[int] = []
+        self._auto_queue_seen: Set[int] = set()
+        self._transcribe_origin: str = ""
 
         # -- Build UI ------------------------------------------------------------
         self._build_toolbar()
@@ -123,6 +144,8 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._connect_signals()
         self._restore_prefs()
+        self._setup_tray()
+        self._start_folder_watch()
 
 
     # ── Toolbar ──────────────────────────────────────────────────────────────
@@ -143,6 +166,10 @@ class MainWindow(QMainWindow):
         load_btn = QPushButton("📂 Load CSV")
         load_btn.clicked.connect(self._on_load_csv_clicked)
         toolbar.addWidget(load_btn)
+
+        watch_btn = QPushButton("👁 Watch Folders")
+        watch_btn.clicked.connect(self._on_watch_folders_clicked)
+        toolbar.addWidget(watch_btn)
 
         toolbar.addSeparator()
 
@@ -209,6 +236,7 @@ class MainWindow(QMainWindow):
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setSortingEnabled(True)
+        self._sort_table_by_created_newest_first()
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_table_context_menu)
         self._table.doubleClicked.connect(self._on_table_double_click)
@@ -409,6 +437,265 @@ class MainWindow(QMainWindow):
         save_prefs(self._prefs)
 
 
+    # ── Tray / folder watch ──────────────────────────────────────────────────
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+        from scripts.gui.style import app_icon
+
+        self._tray = TrayController(
+            app_icon(),
+            self,
+            on_open=self.show_from_tray,
+            on_quit=self._quit_from_tray,
+            on_watch_folders=self._on_watch_folders_clicked,
+            on_auto_transcribe_toggled=self._on_auto_transcribe_toggled,
+            on_start_with_windows_toggled=self._on_start_with_windows_toggled,
+            auto_transcribe=bool(self._prefs.get("watch_enabled", True)),
+            start_with_windows=is_start_with_windows(),
+            show_autostart=sys.platform == "win32",
+        )
+        self._update_tray_tooltip()
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._force_quit = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        ## END if app is not None....
+
+    def _on_auto_transcribe_toggled(self, enabled: bool) -> None:
+        self._prefs["watch_enabled"] = bool(enabled)
+        self._save_prefs()
+        if enabled:
+            self._drain_auto_queue()
+        ## END if enabled....
+
+        self._update_tray_tooltip()
+
+    def _on_start_with_windows_toggled(self, enabled: bool) -> None:
+        ok = set_start_with_windows(bool(enabled))
+        if not ok and enabled:
+            QMessageBox.warning(
+                self,
+                "Start with Windows",
+                "Could not create a Startup shortcut.",
+            )
+            if self._tray is not None:
+                self._tray.set_start_with_windows(False)
+            ## END if self._tray....
+
+        ## END if not ok....
+
+    def _on_watch_folders_clicked(self) -> None:
+        dlg = WatchFoldersDialog(
+            self._prefs.get("watch_folders") or [],
+            auto_transcribe=bool(self._prefs.get("watch_enabled", True)),
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._prefs["watch_folders"] = dlg.folders()
+        self._prefs["watch_enabled"] = dlg.auto_transcribe()
+        self._save_prefs()
+        if self._tray is not None:
+            self._tray.set_auto_transcribe(bool(self._prefs["watch_enabled"]))
+        ## END if self._tray....
+
+        self._start_folder_watch()
+        self._update_tray_tooltip()
+
+    def _start_folder_watch(self) -> None:
+        folders = self._prefs.get("watch_folders") or []
+        if self._watch_worker is not None and self._watch_worker.isRunning():
+            self._watch_worker.set_folders(folders)
+            return
+        self._watch_worker = FolderWatchWorker(folders, parent=self)
+        self._watch_worker.file_ready.connect(self._on_watch_file_ready)
+        self._watch_worker.status_message.connect(self._on_watch_status)
+        self._watch_worker.error.connect(self._on_watch_error)
+        self._watch_worker.start()
+
+    def _on_watch_status(self, message: str) -> None:
+        if self._transcribe_worker is None or not self._transcribe_worker.isRunning():
+            self._status_label.setText(message)
+        ## END if not transcribing....
+
+        self._update_tray_tooltip(watch_status=message)
+
+    def _on_watch_error(self, message: str) -> None:
+        self._status_label.setText(f"Watch error: {message}")
+        self._update_tray_tooltip()
+
+    def _watch_root_for(self, format_id: str, path: Path) -> Path:
+        for spec in self._prefs.get("watch_folders") or []:
+            if str(spec.get("format_id") or "") != format_id:
+                continue
+            root = Path(str(spec.get("path") or ""))
+            try:
+                path.resolve().relative_to(root.resolve())
+                return root
+            except ValueError:
+                continue
+            ## END try relative_to....
+
+        ## END for spec in watch_folders....
+
+        return path.parent
+
+    def _upsert_watched_recording(self, format_id: str, path: Path) -> Optional[int]:
+        try:
+            fmt = get_format(format_id)
+        except KeyError:
+            return None
+        tz = self._prefs.get("scan_timezone") or "America/Los_Angeles"
+        try:
+            row = fmt.build_filelist_row(path, tz_name=tz)
+        except OSError:
+            return None
+        watch_root = self._watch_root_for(format_id, path)
+        if format_id in self._loaded_csvs:
+            csv_path = self._loaded_csvs[format_id]
+        else:
+            csv_path = fmt.resolve_watch_filelist_csv(watch_root)
+            self._loaded_csvs[format_id] = csv_path
+            self._save_prefs()
+        ## END if format_id in self._loaded_csvs....
+
+        upsert_filelist_csv_row(csv_path, row, fmt.extra_filelist_columns)
+        row["format_id"] = format_id
+        row["source_csv"] = str(csv_path)
+        return self._model.upsert_row(row)
+
+    def _on_watch_file_ready(self, format_id: str, path_str: str) -> None:
+        path = Path(path_str)
+        df_index = self._upsert_watched_recording(format_id, path)
+        if df_index is None:
+            return
+        self._enqueue_auto_transcribe(df_index)
+
+    def _enqueue_auto_transcribe(self, df_index: int) -> None:
+        if not self._prefs.get("watch_enabled", True):
+            return
+        df = self._model.get_dataframe()
+        if df_index not in df.index:
+            return
+        row = df.loc[df_index]
+        if has_transcript_path_values(row):
+            return
+        status = str(row.get("status") or "")
+        if status == "duplicate":
+            return
+        job = self._model.job_state(df_index)
+        if job and job.get("phase") in ("queued", "transcribing", "cancelling"):
+            return
+        format_id = str(row.get("format_id") or "")
+        try:
+            fmt = get_format(format_id)
+        except KeyError:
+            return
+        full_path = Path(str(row.get("full_path") or ""))
+        output_dir = output_dir_for_format(fmt, self._watch_root_for(format_id, full_path))
+        name_raw = row.get("name")
+        if name_raw is not None and pd.notna(name_raw) and str(name_raw).strip():
+            base_name = Path(str(name_raw).strip()).stem
+        else:
+            base_name = full_path.stem
+        ## END if name_raw....
+
+        if find_extant_output_files(output_dir, base_name):
+            return
+        if df_index in self._auto_queue_seen:
+            return
+        self._auto_queue.append(int(df_index))
+        self._auto_queue_seen.add(int(df_index))
+        self._drain_auto_queue()
+
+    def _output_dir_for_row(self, row: pd.Series) -> Path:
+        format_id = str(row.get("format_id") or "")
+        try:
+            fmt = get_format(format_id)
+        except KeyError:
+            saved = self._prefs.get("transcribe_output_dir", "") or ""
+            return Path(saved) if saved else Path("transcriptions")
+        full_path = Path(str(row.get("full_path") or ""))
+        return output_dir_for_format(fmt, self._watch_root_for(format_id, full_path))
+
+    def _drain_auto_queue(self) -> None:
+        if not self._prefs.get("watch_enabled", True):
+            return
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            return
+        if not self._auto_queue:
+            return
+        df = self._model.get_dataframe()
+        pending: List[int] = []
+        for df_index in self._auto_queue:
+            if df_index in df.index:
+                pending.append(df_index)
+            ## END if df_index in df.index....
+
+        ## END for df_index in self._auto_queue....
+
+        self._auto_queue = []
+        if not pending:
+            return
+        first_row = df.loc[pending[0]]
+        first_out = self._output_dir_for_row(first_row)
+        same: List[int] = []
+        rest: List[int] = []
+        for df_index in pending:
+            if self._output_dir_for_row(df.loc[df_index]) == first_out:
+                same.append(df_index)
+            else:
+                rest.append(df_index)
+            ## END if same output dir....
+
+        ## END for df_index in pending....
+
+        self._auto_queue = rest
+        self._start_transcription(same, prompt=False, output_dir=first_out)
+
+    def _update_tray_tooltip(self, watch_status: Optional[str] = None) -> None:
+        if self._tray is None:
+            return
+        folders = self._prefs.get("watch_folders") or []
+        enabled_n = sum(1 for spec in folders if spec.get("enabled", True))
+        auto = "on" if self._prefs.get("watch_enabled", True) else "paused"
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            n = self._transcribe_batch_n
+            i = self._transcribe_current_i
+            name = self._transcribe_current_name
+            progress = self._transcribe_current_progress
+            if name:
+                if isinstance(progress, float):
+                    text = (
+                        f"Transcribing {i}/{n} — {name} "
+                        f"{int(round(progress * 100))}%"
+                    )
+                else:
+                    text = f"Transcribing {i}/{n} — {name}"
+            else:
+                text = f"Transcribing {i}/{n}"
+            ## END if name....
+
+        elif watch_status:
+            text = f"{watch_status} · auto-transcribe {auto}"
+        else:
+            text = f"Watching {enabled_n} folder(s) · auto-transcribe {auto}"
+        ## END if transcribing....
+
+        self._tray.set_tooltip(f"Audio Recording Manager — {text}")
+
+
     # ── Toolbar Actions ──────────────────────────────────────────────────────
 
     def _on_scan_clicked(self) -> None:
@@ -511,6 +798,7 @@ class MainWindow(QMainWindow):
         """Re-merge all loaded CSVs and update the table model."""
         df = merge_format_csvs(self._loaded_csvs)
         self._model.set_dataframe(df)
+        self._sort_table_by_created_newest_first()
 
         # Update format filter combo
         current_format = self._format_combo.currentData()
@@ -647,6 +935,15 @@ class MainWindow(QMainWindow):
         self._status_label.setText(msg)
 
 
+    def _sort_table_by_created_newest_first(self) -> None:
+        """Default table order: newest recording dates first, empty dates last."""
+        try:
+            created_col = DISPLAY_COLUMNS.index("extracted_creation_time")
+        except ValueError:
+            return
+        self._table.sortByColumn(created_col, Qt.SortOrder.DescendingOrder)
+
+
     def _auto_size_columns(self) -> None:
         """Auto-size table columns to fit both header names and cell contents."""
         self._table.resizeColumnsToContents()
@@ -723,13 +1020,22 @@ class MainWindow(QMainWindow):
         self._start_transcription(pending_rows)
 
 
-    def _start_transcription(self, source_rows: List[int]) -> None:
+    def _start_transcription(
+        self,
+        source_rows: List[int],
+        *,
+        prompt: bool = True,
+        output_dir: Optional[Path] = None,
+    ) -> None:
         """Launch the TranscribeWorker for the given DataFrame indices."""
         if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
-            QMessageBox.warning(
-                self, "Already Running",
-                "A transcription is already in progress.",
-            )
+            if prompt:
+                QMessageBox.warning(
+                    self, "Already Running",
+                    "A transcription is already in progress.",
+                )
+            ## END if prompt....
+
             return
 
         if not source_rows:
@@ -748,30 +1054,55 @@ class MainWindow(QMainWindow):
             saved_out = self._prefs.get("transcribe_output_dir", "") or ""
             default_out = Path(saved_out) if saved_out else Path("transcriptions")
 
-        # Show config dialog
-        dlg = TranscribeConfigDialog(str(default_out), parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            self._start_transcript_discovery()
-            return
+        if prompt:
+            dlg = TranscribeConfigDialog(
+                str(output_dir or default_out),
+                parent=self,
+                initial_backend=str(
+                    self._prefs.get("transcribe_backend") or "crisperwhisper"
+                ),
+                initial_model=str(self._prefs.get("transcribe_model") or "turbo"),
+                initial_crisper_mode=str(
+                    self._prefs.get("transcribe_crisper_mode") or "verbatim"
+                ),
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self._start_transcript_discovery()
+                return
+            output_dir = dlg.output_dir()
+            backend = dlg.backend()
+            model_name = dlg.model_name()
+            crisper_mode = dlg.crisper_mode()
+            self._prefs["transcribe_output_dir"] = str(output_dir)
+            self._prefs["transcribe_backend"] = backend
+            self._prefs["transcribe_model"] = model_name
+            self._prefs["transcribe_crisper_mode"] = crisper_mode
+            self._save_prefs()
+            self._transcribe_origin = "manual"
+        else:
+            output_dir = Path(output_dir) if output_dir is not None else default_out
+            backend = str(self._prefs.get("transcribe_backend") or "crisperwhisper")
+            model_name = str(self._prefs.get("transcribe_model") or "turbo")
+            crisper_mode = str(self._prefs.get("transcribe_crisper_mode") or "verbatim")
+            self._transcribe_origin = "auto"
+        ## END if prompt....
 
-        output_dir = dlg.output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
-        self._prefs["transcribe_output_dir"] = str(output_dir)
-        self._save_prefs()
 
         # Show log dock
         self._log_dock.show()
         self._log_text.clear()
+        origin = "auto" if not prompt else "manual"
         self._log_text.appendPlainText(
-            f"Starting transcription of {len(selected_df)} file(s)…\n"
+            f"Starting {origin} transcription of {len(selected_df)} file(s)…\n"
         )
 
         self._transcribe_worker = TranscribeWorker(
             rows_df=selected_df,
             output_dir=output_dir,
-            backend=dlg.backend(),
-            model_name=dlg.model_name(),
-            crisper_mode=dlg.crisper_mode(),
+            backend=backend,
+            model_name=model_name,
+            crisper_mode=crisper_mode,
             parent=self,
         )
         self._transcribe_worker.output_line.connect(self._on_transcribe_output)
@@ -794,6 +1125,7 @@ class MainWindow(QMainWindow):
         self._transcribe_all_btn.setEnabled(False)
         self._cancel_transcribe_btn.setEnabled(True)
         self._status_label.setText(f"Transcribing 0/{self._transcribe_batch_n}…")
+        self._update_tray_tooltip()
 
 
     def _refresh_transcribe_status_bar(self) -> None:
@@ -810,6 +1142,7 @@ class MainWindow(QMainWindow):
                 self._status_label.setText(f"Transcribing {i}/{n} — {name}")
         else:
             self._status_label.setText(f"Transcribing {i}/{n}…")
+        self._update_tray_tooltip()
 
 
     def _on_file_transcribe_started(self, df_index: int, name: str, i: int, n: int) -> None:
@@ -937,6 +1270,9 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"Transcription complete: {summary}")
         self._log_text.appendPlainText(f"\n✓ Done — {summary}")
         self._auto_size_columns()
+        self._transcribe_origin = ""
+        self._update_tray_tooltip()
+        QTimer.singleShot(0, self._drain_auto_queue)
 
 
     def _on_transcription_error(self, msg: str) -> None:
@@ -946,7 +1282,14 @@ class MainWindow(QMainWindow):
         self._model.clear_all_job_state()
         self._status_label.setText(f"Transcription error: {msg}")
         self._log_text.appendPlainText(f"\n✗ Error: {msg}")
-        QMessageBox.critical(self, "Transcription Error", msg)
+        origin = self._transcribe_origin
+        self._transcribe_origin = ""
+        self._update_tray_tooltip()
+        if origin != "auto":
+            QMessageBox.critical(self, "Transcription Error", msg)
+        ## END if origin != auto....
+
+        QTimer.singleShot(0, self._drain_auto_queue)
 
 
     def _save_affected_csv(self, df_index: int) -> None:
@@ -1363,30 +1706,82 @@ class MainWindow(QMainWindow):
     # -- Cleanup ---------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
+        if (
+            not self._force_quit
+            and self._tray is not None
+            and self._tray.is_visible()
+        ):
+            self._save_prefs()
+            event.ignore()
+            self.hide()
+            return
+        ## END if hide to tray....
+
         self._save_prefs()
         self._player.cleanup()
         self._stop_transcript_discovery()
+        if self._watch_worker is not None and self._watch_worker.isRunning():
+            self._watch_worker.stop_watch()
+            self._watch_worker.wait(3000)
+        ## END if watch worker running....
+
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self._scan_worker.quit()
             self._scan_worker.wait(3000)
         if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
             self._transcribe_worker.request_cancel()
             self._transcribe_worker.wait(5000)
+        if self._tray is not None:
+            self._tray.hide()
+        ## END if self._tray....
+
         super().closeEvent(event)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """Launch the Audio Recording Manager GUI application."""
-    from PyQt6.QtWidgets import QApplication
-    from scripts.gui.style import apply_dark_theme
+    import argparse
 
-    app = QApplication(sys.argv)
+    from PyQt6.QtWidgets import QApplication
+    from scripts.gui.single_instance import SingleInstance, raise_window
+    from scripts.gui.style import apply_dark_theme, app_icon
+
+    parser = argparse.ArgumentParser(description="Audio Recording Manager")
+    parser.add_argument(
+        "--hidden",
+        action="store_true",
+        help="Start in the system tray without showing the window",
+    )
+    args, qt_args = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
+
+    app = QApplication([sys.argv[0], *qt_args])
     app.setOrganizationName("whisper-timestamped")
     app.setApplicationName("AudioRecordingManager")
+    app.setQuitOnLastWindowClosed(False)
+
+    instance = SingleInstance()
+    if not instance.try_acquire():
+        instance.notify_existing()
+        return
+    ## END if not instance.try_acquire()....
+
     apply_dark_theme(app)
+    icon = app_icon()
+    app.setWindowIcon(icon)
     window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    window.setWindowIcon(icon)
+    instance.listen(lambda: raise_window(window))
+    if args.hidden and QSystemTrayIcon.isSystemTrayAvailable():
+        window.hide()
+    else:
+        window.show()
+    ## END if args.hidden....
+
+    try:
+        sys.exit(app.exec())
+    finally:
+        instance.release()
+
 
 
 if __name__ == "__main__":

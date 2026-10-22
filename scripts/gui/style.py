@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QFont, QPalette, QColor
+from PyQt6.QtGui import QFont, QIcon, QPainter, QPalette, QColor, QPixmap
 from PyQt6.QtCore import Qt
 
 
@@ -367,3 +367,21 @@ def apply_dark_theme(app: QApplication) -> None:
     font = QFont("Segoe UI", 10)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(font)
+
+
+def app_icon() -> QIcon:
+    """Simple drawn icon used for the window and system tray."""
+    pix = QPixmap(64, 64)
+    pix.fill(QColor("#1e1e2e"))
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor("#7c5cfc"))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawRoundedRect(8, 8, 48, 48, 12, 12)
+    painter.setPen(QColor("#e0e0ef"))
+    font = QFont("Segoe UI", 22)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "W")
+    painter.end()
+    return QIcon(pix)
