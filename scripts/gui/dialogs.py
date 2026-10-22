@@ -204,7 +204,7 @@ class TranscribeConfigDialog(QDialog):
         form.addRow("Backend:", self._backend_combo)
 
         # Model
-        self._model_edit = QLineEdit("medium")
+        self._model_edit = QLineEdit("turbo")
         form.addRow("Model:", self._model_edit)
 
         # CrisperWhisper mode
@@ -245,10 +245,10 @@ class TranscribeConfigDialog(QDialog):
         self._mode_label.setVisible(is_crisper)
         # Default model name based on backend
         if is_crisper:
-            if self._model_edit.text() == "medium.en":
-                self._model_edit.setText("medium")
+            if self._model_edit.text() in ("medium.en", "medium"):
+                self._model_edit.setText("turbo")
         else:
-            if self._model_edit.text() == "medium":
+            if self._model_edit.text() in ("turbo", "medium"):
                 self._model_edit.setText("medium.en")
 
 
@@ -266,7 +266,7 @@ class TranscribeConfigDialog(QDialog):
 
 
     def model_name(self) -> str:
-        return self._model_edit.text().strip() or "medium"
+        return self._model_edit.text().strip() or "turbo"
 
 
     def crisper_mode(self) -> str:

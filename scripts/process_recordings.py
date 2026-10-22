@@ -466,7 +466,7 @@ def process_recordings(
 
     # Load the model once (after file discovery so progress is visible sooner)
     if model_name is None:
-        model_name = "medium" if backend == "crisperwhisper" else "medium.en"
+        model_name = "turbo" if backend == "crisperwhisper" else "medium.en"
     model_path_root = host_path(model_path_root).resolve()
     # CrisperWhisper weights come from HuggingFace cache, not model_path_root.
     if backend != "crisperwhisper":
@@ -817,7 +817,7 @@ if __name__ == "__main__":
         output_files = process_recordings(
             **process_recordings_kwargs,
             backend="crisperwhisper",
-            model_name="medium",
+            model_name="turbo",
             crisper_mode="verbatim",
             crisper_runtime="auto",  # CT2 on WSL2 with --extra crisper_ct2; transformers on Windows
         )

@@ -53,7 +53,7 @@ class TranscribeWorker(QThread):
     all_done = pyqtSignal(int, int, int)           # (completed, failed, cancelled)
     error = pyqtSignal(str)
 
-    def __init__(self, rows_df: pd.DataFrame, output_dir: Path, backend: str = "crisperwhisper", model_name: str = "medium", crisper_mode: str = "verbatim", crisper_runtime: str = "auto", parent=None) -> None:
+    def __init__(self, rows_df: pd.DataFrame, output_dir: Path, backend: str = "crisperwhisper", model_name: str = "turbo", crisper_mode: str = "verbatim", crisper_runtime: str = "auto", parent=None) -> None:
         super().__init__(parent)
         self.rows_df = rows_df.copy()
         self.rows_df[ARM_DF_INDEX_COL] = [int(i) for i in self.rows_df.index]

@@ -37,7 +37,7 @@ OFFICIAL_MODELS = {
         "large_pro", "turbo_pro", "medium_pro", "small_pro",
     )
 }
-DEFAULT_MODEL = OFFICIAL_MODELS["large"]
+DEFAULT_MODEL = OFFICIAL_MODELS["turbo"]
 
 
 def resolve_model_id(name_or_path: str) -> str:
