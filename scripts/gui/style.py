@@ -48,6 +48,7 @@ _ACCENT       = "#7c5cfc"
 _ACCENT_HOVER = "#9b80fd"
 _BORDER       = "#3f3f5f"
 _SELECTION_BG = "#4a3fa8"
+SELECTION_BG  = _SELECTION_BG
 
 
 DARK_QSS = f"""
@@ -339,6 +340,44 @@ QLabel#statusBadge {{
     padding: 2px 8px;
     border-radius: 4px;
     font-size: 11px;
+    font-weight: 600;
+}}
+
+/* ── Recordings calendar ────────────────────────────────────────── */
+QScrollArea#recordingCalendar {{
+    background-color: {_BG_DARK};
+    border: none;
+}}
+QWidget#recordingCalendar, QWidget#calendarMonth {{
+    background-color: {_BG_DARK};
+}}
+QLabel#calendarMonthHeader {{
+    font-weight: 600;
+    font-size: 13px;
+    padding: 2px 2px 4px 2px;
+}}
+QLabel#calendarWeekday {{
+    color: {_FG_DIM};
+    font-size: 10px;
+    font-weight: 600;
+}}
+QWidget#calendarDayCell {{
+    background-color: {_BG_WIDGET};
+    border: 1px solid {_BORDER};
+    border-radius: 4px;
+}}
+QLabel#calendarDayNumber {{
+    color: {_FG_DIM};
+    font-size: 10px;
+}}
+QPushButton#calendarDot {{
+    min-width: 18px;
+    max-width: 18px;
+    min-height: 18px;
+    max-height: 18px;
+    border-radius: 9px;
+    padding: 0px;
+    font-size: 9px;
     font-weight: 600;
 }}
 """

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QItemSelectionModel, Qt, QTimer
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -46,6 +46,11 @@ if _REPO_ROOT not in sys.path:
 
 from scripts.gui.audio_player import AudioPlayer
 from scripts.gui.autostart import is_start_with_windows, set_start_with_windows
+from scripts.gui.calendar_view import (
+    CalendarEntry,
+    RecordingCalendarWidget,
+    make_calendar_entry,
+)
 from scripts.gui.dialogs import (
     ScanConfigDialog,
     TranscribeConfigDialog,
@@ -135,10 +140,13 @@ class MainWindow(QMainWindow):
         self._auto_queue: List[int] = []
         self._auto_queue_seen: Set[int] = set()
         self._transcribe_origin: str = ""
+        self._syncing_selection: bool = False
+        self._calendar_refresh_pending: bool = False
 
         # -- Build UI ------------------------------------------------------------
         self._build_toolbar()
         self._build_table()
+        self._build_calendar_dock()
         self._build_preview_dock()
         self._build_playback_dock()
         self._build_log_dock()
@@ -275,6 +283,24 @@ class MainWindow(QMainWindow):
             sel_model.currentChanged.connect(self._on_selection_changed)
 
 
+    # ── Recordings Calendar Dock (Right Side, above preview) ─────────────────
+
+    def _build_calendar_dock(self) -> None:
+        dock = QDockWidget("Calendar", self)
+        dock.setObjectName("recordingsCalendarDock")
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+        )
+        self._calendar = RecordingCalendarWidget()
+        self._calendar.dot_clicked.connect(self._on_calendar_dot_clicked)
+        dock.setWidget(self._calendar)
+        dock.setMinimumWidth(320)
+        dock.setMinimumHeight(160)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._calendar_dock = dock
+
+
     # ── Transcript Preview Dock (Right Side) ─────────────────────────────────
 
     def _build_preview_dock(self) -> None:
@@ -320,6 +346,12 @@ class MainWindow(QMainWindow):
         dock.setWidget(container)
         dock.setMinimumWidth(320)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.splitDockWidget(self._calendar_dock, dock, Qt.Orientation.Vertical)
+        self.resizeDocks(
+            [self._calendar_dock, dock],
+            [240, 500],
+            Qt.Orientation.Vertical,
+        )
         self._preview_dock = dock
 
 
@@ -418,6 +450,11 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self._model.data_changed_signal.connect(self._update_status_bar)
+        self._model.data_changed_signal.connect(self._refresh_calendar)
+        self._proxy.layoutChanged.connect(self._refresh_calendar)
+        self._proxy.modelReset.connect(self._refresh_calendar)
+        self._proxy.rowsInserted.connect(self._refresh_calendar)
+        self._proxy.rowsRemoved.connect(self._refresh_calendar)
         self._player.position_changed.connect(self._on_position_changed)
         self._player.duration_changed.connect(self._on_duration_changed)
         self._player.state_changed.connect(self._on_player_state_changed)
@@ -1040,8 +1077,11 @@ class MainWindow(QMainWindow):
 
     def _get_selected_source_rows(self) -> List[int]:
         """Get source model row indices for the current table selection."""
+        sel_model = self._table.selectionModel()
+        if sel_model is None:
+            return []
         rows = set()
-        for idx in self._table.selectionModel().selectedRows():
+        for idx in sel_model.selectedRows():
             source_idx = self._proxy.mapToSource(idx)
             rows.add(source_idx.row())
         ## END for idx in selectedRows...
@@ -1567,7 +1607,11 @@ class MainWindow(QMainWindow):
 
 
     def _on_selection_changed(self, *args) -> None:
-        """Update transcript preview when table row selection changes."""
+        """Update transcript preview and calendar dots when table selection changes."""
+        df_indices = self._visual_rows_to_df_indices(self._get_selected_source_rows())
+        scroll = (not self._syncing_selection) and len(df_indices) == 1
+        self._calendar.set_selected(df_indices, scroll=scroll)
+
         sel_model = self._table.selectionModel()
         if sel_model is None:
             self._update_transcript_preview(None)
@@ -1586,6 +1630,74 @@ class MainWindow(QMainWindow):
 
         row_data = self._model.get_row_data(source_idx.row())
         self._update_transcript_preview(row_data)
+
+
+    def _visible_calendar_entries(self) -> List[CalendarEntry]:
+        """Dated recordings currently visible in the filtered table."""
+        entries: List[CalendarEntry] = []
+        for proxy_row in range(self._proxy.rowCount()):
+            source = self._proxy.mapToSource(self._proxy.index(proxy_row, 0))
+            if not source.isValid():
+                continue
+            df_index = self._model.df_index_for_row(source.row())
+            row_data = self._model.get_row_data(source.row())
+            if df_index is None or row_data is None:
+                continue
+            entry = make_calendar_entry(
+                int(df_index),
+                row_data.get("extracted_creation_time"),
+                row_data.get("name", ""),
+                row_data.get("status", "pending"),
+            )
+            if entry is not None:
+                entries.append(entry)
+            ## END if entry is not None....
+
+        ## END for proxy_row in range....
+
+        return entries
+
+
+    def _refresh_calendar(self, *args) -> None:
+        """Rebuild calendar dots from the filtered table (coalesced to one shot)."""
+        if self._calendar_refresh_pending:
+            return
+        self._calendar_refresh_pending = True
+        QTimer.singleShot(0, self._apply_calendar_entries)
+
+
+    def _apply_calendar_entries(self) -> None:
+        self._calendar_refresh_pending = False
+        self._calendar.set_entries(self._visible_calendar_entries())
+        df_indices = self._visual_rows_to_df_indices(self._get_selected_source_rows())
+        self._calendar.set_selected(df_indices, scroll=False)
+
+
+    def _on_calendar_dot_clicked(self, df_index: int) -> None:
+        """Select the table row for a calendar dot (single-select, no calendar scroll)."""
+        visual_row = self._model.visual_row_for_df_index(int(df_index))
+        if visual_row is None:
+            return
+        source_idx = self._model.index(visual_row, 0)
+        proxy_idx = self._proxy.mapFromSource(source_idx)
+        if not proxy_idx.isValid():
+            return
+        self._syncing_selection = True
+        try:
+            sel_model = self._table.selectionModel()
+            if sel_model is not None:
+                flags = (
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows
+                )
+                sel_model.setCurrentIndex(proxy_idx, flags)
+            else:
+                self._table.selectRow(proxy_idx.row())
+            ## END if sel_model is not None....
+
+            self._table.scrollTo(proxy_idx)
+        finally:
+            self._syncing_selection = False
 
 
     def _update_transcript_preview(self, row_data: Optional[pd.Series]) -> None:

@@ -4,16 +4,16 @@ overview: Add a compact, scrollable month calendar in the right column above Tra
 todos:
   - id: calendar-widget
     content: "Add calendar_view.py: month stack, numbered day dots, set_selected(scroll=), grouping helper"
-    status: in_progress
+    status: completed
   - id: dock-wiring
     content: Stack Calendar dock above Transcript Preview; rebuild from filtered proxy; two-way selection sync
-    status: pending
+    status: completed
   - id: style-dots
     content: Style numbered dots with status colors and table-like selection highlight
-    status: pending
+    status: completed
   - id: tests
     content: Unit tests for day numbering/grouping and scroll-only-on-single-select
-    status: pending
+    status: completed
 isProject: false
 ---
 

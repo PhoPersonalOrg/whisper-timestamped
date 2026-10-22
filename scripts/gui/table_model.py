@@ -444,6 +444,14 @@ class RecordingTableModel(QAbstractTableModel):
         return None
 
 
+    def visual_row_for_df_index(self, df_index: int) -> Optional[int]:
+        """Map DataFrame index to visual row, or None if the row is gone."""
+        try:
+            return list(self._df.index).index(int(df_index))
+        except ValueError:
+            return None
+
+
     # -- QAbstractTableModel overrides -----------------------------------------
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
