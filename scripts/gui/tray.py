@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from PyQt6.QtGui import QAction, QCursor, QIcon
+from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 
 class TrayController:
-    """Right-click / double-click shows the GUI; left-click opens a control menu."""
+    """Right-click shows a context menu (including Exit); left/double-click opens the GUI."""
 
     def __init__(
         self,
@@ -61,10 +61,11 @@ class TrayController:
         ## END if show_autostart....
 
         self._menu.addSeparator()
-        quit_action = QAction("Quit", self._menu)
-        quit_action.triggered.connect(self._on_quit)
-        self._menu.addAction(quit_action)
+        exit_action = QAction("Exit", self._menu)
+        exit_action.triggered.connect(self._on_quit)
+        self._menu.addAction(exit_action)
 
+        self._tray.setContextMenu(self._menu)
         self._tray.show()
 
     def is_visible(self) -> bool:
@@ -90,12 +91,9 @@ class TrayController:
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
-            QSystemTrayIcon.ActivationReason.Context,
+            QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.DoubleClick,
             QSystemTrayIcon.ActivationReason.MiddleClick,
         ):
             self._on_open()
-            return
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._menu.popup(QCursor.pos())
         ## END if reason....

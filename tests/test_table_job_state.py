@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +23,7 @@ from scripts.gui.table_model import (
     RecordingFilterProxy,
     RecordingTableModel,
     compute_status,
+    format_created_ago,
 )
 
 
@@ -164,6 +166,76 @@ class TestCreatedColumnSort(unittest.TestCase):
         names = _proxy_names(self._sorted_proxy(Qt.SortOrder.AscendingOrder))
         self.assertEqual(names[:3], ["old", "mid", "newest"])
         self.assertEqual(set(names[3:]), {"empty", "bad"})
+
+
+class TestFormatCreatedAgo(unittest.TestCase):
+    # Thursday, Oct 22 2026, 11:00 local
+    NOW = datetime(2026, 10, 22, 11, 0, 0)
+
+    def _ago(self, value: str) -> str:
+        return format_created_ago(value, now=self.NOW)
+
+    def test_empty_and_unparseable_are_blank(self):
+        self.assertEqual(self._ago(""), "")
+        self.assertEqual(self._ago("not-a-date"), "")
+        self.assertEqual(format_created_ago(None, now=self.NOW), "")
+
+    def test_under_one_hour_and_future_skew(self):
+        self.assertEqual(self._ago("2026-10-22 10:30:00"), "<1 hr ago")
+        self.assertEqual(self._ago("2026-10-22 11:10:00"), "<1 hr ago")
+
+    def test_hours(self):
+        self.assertEqual(self._ago("2026-10-22 08:50:00"), "~2 hr ago")
+        self.assertEqual(self._ago("2026-10-21 12:00:00"), "~23 hr ago")
+
+    def test_days_with_weekday(self):
+        self.assertEqual(self._ago("2026-10-21 08:00:00"), "1 day ago (Wed)")
+        self.assertEqual(self._ago("2026-10-20 10:00:00"), "2 days ago (Tue)")
+        self.assertEqual(self._ago("2026-10-16 10:00:00"), "6 days ago (Fri)")
+
+    def test_last_weekday(self):
+        self.assertEqual(self._ago("2026-10-15 10:00:00"), "Last Thu")
+        self.assertEqual(self._ago("2026-10-09 10:00:00"), "Last Fri")
+
+    def test_weeks_months_years(self):
+        self.assertEqual(self._ago("2026-10-08 10:00:00"), "2 weeks ago")
+        self.assertEqual(self._ago("2026-09-01 10:00:00"), "7 weeks ago")
+        self.assertEqual(self._ago("2026-08-20 10:00:00"), "2 months ago")
+        self.assertEqual(self._ago("2025-10-22 10:00:00"), "12 months ago")
+        self.assertEqual(self._ago("2024-10-22 10:00:00"), "2 years ago")
+
+
+class TestAgoColumn(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = _app()
+
+    def test_ago_sits_next_to_created(self):
+        created_col = DISPLAY_COLUMNS.index("extracted_creation_time")
+        self.assertEqual(DISPLAY_COLUMNS[created_col + 1], "ago")
+
+    def test_ago_is_not_materialized_in_dataframe(self):
+        model = RecordingTableModel()
+        model.set_dataframe(_created_sort_df())
+        self.assertNotIn("ago", model.get_dataframe().columns)
+        model.upsert_row({"name": "x", "full_path": "/tmp/x.mkv"})
+        self.assertNotIn("ago", model.get_dataframe().columns)
+
+    def test_ago_display_and_sort_match_created(self):
+        model = RecordingTableModel()
+        model.set_dataframe(_created_sort_df())
+        proxy = RecordingFilterProxy()
+        proxy.setSourceModel(model)
+        ago_col = DISPLAY_COLUMNS.index("ago")
+        proxy.sort(ago_col, Qt.SortOrder.DescendingOrder)
+        names = _proxy_names(proxy)
+        self.assertEqual(names[:3], ["newest", "mid", "old"])
+        self.assertEqual(set(names[3:]), {"empty", "bad"})
+        # Rows with a timestamp render a relative label; blanks stay blank.
+        top_label = str(proxy.data(proxy.index(0, ago_col)) or "")
+        self.assertTrue("ago" in top_label or top_label.startswith("Last"), top_label)
+        self.assertEqual(proxy.data(proxy.index(3, ago_col)) or "", "")
+        self.assertEqual(proxy.data(proxy.index(4, ago_col)) or "", "")
 
 
 if __name__ == "__main__":

@@ -68,6 +68,56 @@ def format_created_display(value: Any) -> str:
     return f"{date_part}, {hour}:{minute}{ampm}"
 
 
+def format_created_ago(value: Any, now: Optional[datetime] = None) -> str:
+    """Now-relative label for a creation timestamp.
+
+    Ladder (elapsed time from *now*):
+      - under 1 hour        -> ``<1 hr ago`` (also used for small future skew)
+      - under 24 hours      -> ``~N hr ago``
+      - 1-6 calendar days   -> ``1 day ago (Tue)`` / ``N days ago (Mon)``
+      - 7-13 calendar days  -> ``Last Wed``
+      - 2-7 weeks           -> ``N weeks ago``
+      - under 2 years       -> ``N months ago``
+      - otherwise           -> ``N years ago``
+    """
+    dt = parse_created_datetime(value)
+    if dt is None:
+        return ""
+    if now is None:
+        now = datetime.now()
+    ## END if now is None....
+
+    elapsed = now - dt
+    seconds = elapsed.total_seconds()
+    if seconds < 3600:
+        return "<1 hr ago"
+    if seconds < 86400:
+        hours = max(1, int(round(seconds / 3600)))
+        return f"~{hours} hr ago"
+    ## END if under 24 hours....
+
+    days = (now.date() - dt.date()).days
+    weekday = dt.strftime("%a")
+    if days <= 0:
+        # Over 24h elapsed but same calendar date cannot happen; guard anyway.
+        days = 1
+    if days <= 6:
+        unit = "day" if days == 1 else "days"
+        return f"{days} {unit} ago ({weekday})"
+    if days <= 13:
+        return f"Last {weekday}"
+    if days < 56:
+        weeks = max(2, int(round(days / 7)))
+        return f"{weeks} weeks ago"
+    if days < 730:
+        months = max(2, int(round(days / 30)))
+        return f"{months} months ago"
+    ## END if days ladder....
+
+    years = max(2, int(round(days / 365)))
+    return f"{years} years ago"
+
+
 # -- Column configuration -----------------------------------------------------
 
 # Columns shown in the table (in order). The model stores the full DataFrame
@@ -80,9 +130,14 @@ DISPLAY_COLUMNS: List[str] = [
     "size_mb",
     "duration_hms",
     "extracted_creation_time",
+    "ago",
     "is_duplicate",
     "transcript_txt",
 ]
+
+# Display-only columns derived at render time; never materialized in the
+# backing DataFrame (so they never leak into saved filelist CSVs).
+VIRTUAL_COLUMNS: frozenset = frozenset({"ago"})
 
 # Nice header labels
 COLUMN_HEADERS: Dict[str, str] = {
@@ -93,6 +148,7 @@ COLUMN_HEADERS: Dict[str, str] = {
     "size_mb": "Size (MB)",
     "duration_hms": "Duration",
     "extracted_creation_time": "Created",
+    "ago": "Ago",
     "is_duplicate": "Dup",
     "transcript_txt": "Transcript",
 }
@@ -178,6 +234,8 @@ class RecordingTableModel(QAbstractTableModel):
         self._df = df.copy()
         # Ensure all display columns exist
         for col in self._columns:
+            if col in VIRTUAL_COLUMNS:
+                continue
             if col not in self._df.columns:
                 self._df[col] = ""
         ## END for col in self._columns...
@@ -274,6 +332,16 @@ class RecordingTableModel(QAbstractTableModel):
         self.dataChanged.emit(top_left, bottom_right)
 
 
+    def refresh_ago_column(self) -> None:
+        """Re-render the now-relative Ago column without touching the DataFrame."""
+        if self._df.empty or "ago" not in self._columns:
+            return
+        col = self._columns.index("ago")
+        top = self.index(0, col)
+        bottom = self.index(len(self._df) - 1, col)
+        self.dataChanged.emit(top, bottom, [Qt.ItemDataRole.DisplayRole])
+
+
     def queued_df_indices(self) -> List[int]:
         return [
             idx for idx, state in self._job_state.items()
@@ -319,6 +387,8 @@ class RecordingTableModel(QAbstractTableModel):
         ## END if matching full_path....
 
         for col in list(row.keys()) + list(self._columns):
+            if col in VIRTUAL_COLUMNS:
+                continue
             if col not in self._df.columns:
                 self._df[col] = ""
             ## END if col not in self._df.columns....
@@ -425,13 +495,15 @@ class RecordingTableModel(QAbstractTableModel):
                 return ""
             if col_name == "extracted_creation_time":
                 return format_created_display(raw_value)
+            if col_name == "ago":
+                return format_created_ago(self._df.iloc[row].get("extracted_creation_time", ""))
             if pd.isna(raw_value):
                 return ""
             return str(raw_value)
 
         if role == Qt.ItemDataRole.UserRole:
-            if col_name == "extracted_creation_time":
-                dt = parse_created_datetime(raw_value)
+            if col_name in ("extracted_creation_time", "ago"):
+                dt = parse_created_datetime(self._df.iloc[row].get("extracted_creation_time", ""))
                 return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else ""
             if pd.isna(raw_value):
                 return ""
@@ -487,8 +559,8 @@ class RecordingTableModel(QAbstractTableModel):
             if col_name == "name":
                 full_path = self._df.iloc[row].get("full_path", "")
                 return str(full_path) if pd.notna(full_path) else ""
-            if col_name == "extracted_creation_time":
-                dt = parse_created_datetime(raw_value)
+            if col_name in ("extracted_creation_time", "ago"):
+                dt = parse_created_datetime(self._df.iloc[row].get("extracted_creation_time", ""))
                 return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else ""
             return None
 
@@ -635,7 +707,7 @@ class RecordingFilterProxy(QSortFilterProxyModel):
         ascending (oldest first) and descending (newest first) order.
         """
         model = self.sourceModel()
-        if isinstance(model, RecordingTableModel) and model.column_name(left.column()) == "extracted_creation_time":
+        if isinstance(model, RecordingTableModel) and model.column_name(left.column()) in ("extracted_creation_time", "ago"):
             left_key = model.data(left, Qt.ItemDataRole.UserRole) or ""
             right_key = model.data(right, Qt.ItemDataRole.UserRole) or ""
             left_empty = not left_key

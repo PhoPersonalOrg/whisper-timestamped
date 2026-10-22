@@ -147,6 +147,12 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._start_folder_watch()
 
+        # Keep the now-relative "Ago" column fresh while the window stays open.
+        self._ago_refresh_timer = QTimer(self)
+        self._ago_refresh_timer.setInterval(60_000)
+        self._ago_refresh_timer.timeout.connect(self._model.refresh_ago_column)
+        self._ago_refresh_timer.start()
+
 
     # ── Toolbar ──────────────────────────────────────────────────────────────
 
