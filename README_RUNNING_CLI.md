@@ -44,10 +44,14 @@ uv run python scripts/process_recordings.py \
 
 Provide **at most one** of `--filelist` or `--recordings_dir`. When neither is set, the format’s default input mode is used (filelist formats pick the newest matching CSV by mtime).
 
-## Running via GUI:
+## Running via GUI
+
+On Windows, double-click `Launch GUI.bat` in the repo root. It runs `uv` with the `gui` extra (PyQt6) and opens the Audio Recording Manager.
+
+From a terminal in the repo root:
 
 ```bash
-
-uv run python .\scripts\gui
-
+uv run --extra gui whisper_timestamped_gui
+# equivalent:
+uv run --extra gui python -m scripts.gui
 ```

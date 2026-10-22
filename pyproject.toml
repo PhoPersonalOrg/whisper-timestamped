@@ -115,6 +115,7 @@ whisper_timestamped = "whisper_timestamped.transcribe:cli"
 whisper_timestamped_make_subtitles = "whisper_timestamped.make_subtitles:cli"
 whisper_timestamped_live = "whisper_timestamped.live:cli"
 whisper_timestamped_watch = "whisper_timestamped.watcher:cli"
+whisper_timestamped_gui = "whisper_timestamped.gui_cli:cli"
 
 [build-system]
 requires = ["setuptools>=45", "wheel"]

@@ -66,7 +66,7 @@
 					"tooltip": "Launch Recording Transcriber GUI",
 					"color": "#ed9600",
 					"useVsCodeApi": false,
-					"command": "uv run python scripts/gui"
+					"command": "uv run --extra gui whisper_timestamped_gui"
 				},
 				{
 					"name": "⇥ Convert to File Spaces",
