@@ -22,8 +22,10 @@ from whisper_timestamped.recording_formats.rec_continuous import (
 )
 from whisper_timestamped.recording_formats.registry import (
     FORMATS,
+    canonical_format_id,
     detect_format,
     get_format,
+    list_canonical_format_ids,
     list_canonical_formats,
     list_format_ids,
 )
@@ -55,11 +57,13 @@ __all__ = [
     "RecordingsFormat",
     "VoiceMemosFormat",
     "FileSnapshot",
+    "canonical_format_id",
     "default_watch_folders",
     "detect_format",
     "get_format",
     "is_recording_complete",
     "is_size_mtime_stable",
+    "list_canonical_format_ids",
     "list_canonical_formats",
     "list_format_ids",
     "normalize_watch_folders",

@@ -37,7 +37,11 @@ from scripts.gui.idle import (
     normalize_idle_seconds,
     normalize_run_when,
 )
-from whisper_timestamped.recording_formats import detect_format, list_format_ids
+from whisper_timestamped.recording_formats import (
+    canonical_format_id,
+    detect_format,
+    list_canonical_format_ids,
+)
 
 IDLE_LABELS = {
     60: "1 minute",
@@ -328,11 +332,11 @@ class SettingsDialog(QDialog):
         self._table.setItem(row, 0, enabled_item)
 
         format_combo = QComboBox()
-        for fid in list_format_ids():
+        for fid in list_canonical_format_ids():
             format_combo.addItem(fid, fid)
-        ## END for fid in list_format_ids()....
+        ## END for fid in list_canonical_format_ids()....
 
-        format_id = str(spec.get("format_id") or "")
+        format_id = canonical_format_id(str(spec.get("format_id") or ""))
         idx = format_combo.findData(format_id)
         if idx >= 0:
             format_combo.setCurrentIndex(idx)

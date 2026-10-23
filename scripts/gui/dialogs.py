@@ -20,8 +20,10 @@ from PyQt6.QtWidgets import (
 )
 
 from whisper_timestamped.recording_formats import (
+    canonical_format_id,
+    detect_format,
     get_format,
-    list_format_ids,
+    list_canonical_format_ids,
     RecordingsFormat,
 )
 
@@ -61,13 +63,13 @@ class ScanConfigDialog(QDialog):
         # Format
         self._format_combo = QComboBox()
         self._format_combo.addItem("Auto-detect", "")
-        for fid in list_format_ids():
+        for fid in list_canonical_format_ids():
             fmt = get_format(fid)
             self._format_combo.addItem(f"{fid} — {fmt.label}", fid)
-        ## END for fid in list_format_ids()...
+        ## END for fid in list_canonical_format_ids()...
         self._format_combo.currentIndexChanged.connect(self._on_format_changed)
         if initial_format_id:
-            idx = self._format_combo.findData(initial_format_id)
+            idx = self._format_combo.findData(canonical_format_id(initial_format_id))
             if idx >= 0:
                 self._format_combo.setCurrentIndex(idx)
         form.addRow("Format:", self._format_combo)

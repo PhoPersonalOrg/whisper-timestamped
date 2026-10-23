@@ -82,3 +82,19 @@ def list_canonical_formats() -> List[RecordingsFormat]:
 
 def list_format_ids() -> List[str]:
     return sorted(FORMATS.keys())
+
+
+def list_canonical_format_ids() -> List[str]:
+    """Sorted ids for user-facing pickers (aliases omitted)."""
+    return sorted(f.id for f in _DETECT_ORDER)
+
+
+_ALIAS_TO_CANONICAL: Dict[str, str] = {
+    "rec_continuous": "rec_continuous_video_recorder",
+}
+
+
+def canonical_format_id(format_id: str) -> str:
+    """Map an alias id (e.g. ``rec_continuous``) to its canonical id."""
+    key = (format_id or "").strip().lower()
+    return _ALIAS_TO_CANONICAL.get(key, key)
