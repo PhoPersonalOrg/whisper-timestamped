@@ -1,4 +1,4 @@
-"""Scrollable month calendar of recordings as numbered day-dots."""
+"""Scrollable month calendar of recordings as tiny day-dots."""
 
 from __future__ import annotations
 
@@ -16,14 +16,15 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
+from PyQt6.QtGui import QColor, QMouseEvent, QPainter, QPen
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
     QLabel,
     QLayout,
     QLayoutItem,
-    QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +34,9 @@ from scripts.gui.table_model import format_created_display, parse_created_dateti
 
 MonthKey = Tuple[int, int]
 DayMap = Dict[date, List["CalendarEntry"]]
+DOT_SIZE = 5
+DOT_SPACING = 1
+CELL_HEIGHT = 44
 
 
 @dataclass(frozen=True)
@@ -98,40 +102,10 @@ def group_calendar_entries(
     return grouped
 
 
-def _contrasting_text(hex_color: str) -> str:
-    text = hex_color.lstrip("#")
-    if len(text) != 6:
-        return "#1e1e2e"
-    r = int(text[0:2], 16)
-    g = int(text[2:4], 16)
-    b = int(text[4:6], 16)
-    if (0.299 * r + 0.587 * g + 0.114 * b) > 160:
-        return "#1e1e2e"
-    return "#ffffff"
-
-
-def _dot_stylesheet(status: str, selected: bool) -> str:
-    fill = STATUS_COLORS.get(status, STATUS_COLORS["pending"])
-    text = _contrasting_text(fill)
-    border = SELECTION_BG if selected else "transparent"
-    width = 2 if selected else 1
-    return (
-        "QPushButton#calendarDot {"
-        f"background-color: {fill}; color: {text};"
-        f"border: {width}px solid {border};"
-        "border-radius: 9px; padding: 0px;"
-        "font-size: 9px; font-weight: 600;"
-        "}"
-        "QPushButton#calendarDot:hover {"
-        "border: 2px solid #9b80fd;"
-        "}"
-    )
-
-
 class _FlowLayout(QLayout):
     """Left-to-right wrapping layout for recording dots inside a day cell."""
 
-    def __init__(self, parent: Optional[QWidget] = None, spacing: int = 2) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, spacing: int = DOT_SPACING) -> None:
         super().__init__(parent)
         self._items: List[QLayoutItem] = []
         self.setContentsMargins(0, 0, 0, 0)
@@ -157,10 +131,8 @@ class _FlowLayout(QLayout):
         return Qt.Orientation(0)
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802
-        return True
-
-    def heightForWidth(self, width: int) -> int:  # noqa: N802
-        return self._do_layout(QRect(0, 0, width, 0), True)
+        # Do not report wrapped height — day cells stay a uniform calendar size.
+        return False
 
     def setGeometry(self, rect: QRect) -> None:  # noqa: N802
         super().setGeometry(rect)
@@ -170,14 +142,11 @@ class _FlowLayout(QLayout):
         return self.minimumSize()
 
     def minimumSize(self) -> QSize:  # noqa: N802
-        size = QSize()
-        for item in self._items:
-            size = size.expandedTo(item.minimumSize())
-        ## END for item in self._items....
-
         margins = self.contentsMargins()
-        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
-        return size
+        return QSize(
+            DOT_SIZE + margins.left() + margins.right(),
+            DOT_SIZE + margins.top() + margins.bottom(),
+        )
 
     def _do_layout(self, rect: QRect, test_only: bool) -> int:
         x = rect.x()
@@ -206,33 +175,78 @@ class _FlowLayout(QLayout):
         return y + line_height - rect.y()
 
 
-class _RecordingDot(QPushButton):
-    """Circular numbered badge for one recording on a day."""
+class _RecordingDot(QWidget):
+    """Tiny painted pin for one recording; avoids QPushButton min-size/padding."""
 
     clicked_index = pyqtSignal(int)
 
     def __init__(self, entry: CalendarEntry, parent: Optional[QWidget] = None) -> None:
-        super().__init__(str(entry.day_number), parent)
+        super().__init__(parent)
         self.df_index = entry.df_index
         self._status = entry.status
+        self._selected = False
+        self._hover = False
         self.setObjectName("calendarDot")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setFixedSize(18, 18)
-        self.setToolTip(f"{entry.name}\n{format_created_display(entry.dt)}")
-        self._apply_selected(False)
-        self.clicked.connect(lambda: self.clicked_index.emit(self.df_index))
+        self.setFixedSize(DOT_SIZE, DOT_SIZE)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setToolTip(
+            f"#{entry.day_number} {entry.name}\n{format_created_display(entry.dt)}"
+        )
 
     def set_selected(self, selected: bool) -> None:
-        self._apply_selected(selected)
+        self._selected = bool(selected)
+        self.setProperty("selected", self._selected)
+        self.update()
 
-    def _apply_selected(self, selected: bool) -> None:
-        self.setProperty("selected", selected)
-        self.setStyleSheet(_dot_stylesheet(self._status, selected))
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked_index.emit(self.df_index)
+            event.accept()
+            return
+        ## END if left click....
+
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        fill = QColor(STATUS_COLORS.get(self._status, STATUS_COLORS["pending"]))
+        if self._selected:
+            border = QColor(SELECTION_BG)
+        elif self._hover:
+            border = QColor("#9b80fd")
+        else:
+            border = fill
+        ## END if selected/hover....
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(fill)
+        painter.setPen(QPen(border, 1))
+        inset = 0.5
+        painter.drawEllipse(
+            QRect(
+                int(inset),
+                int(inset),
+                DOT_SIZE - 1,
+                DOT_SIZE - 1,
+            )
+        )
+        painter.end()
 
 
 class _DayCell(QWidget):
-    """One in-month day: date number plus wrapping recording dots."""
+    """One in-month day: date number plus a compact cluster of pin-dots."""
 
     def __init__(
         self,
@@ -242,17 +256,19 @@ class _DayCell(QWidget):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("calendarDayCell")
-        self.setMinimumSize(36, 36)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(24, CELL_HEIGHT)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(3, 2, 3, 3)
-        layout.setSpacing(2)
+        layout.setContentsMargins(2, 1, 2, 2)
+        layout.setSpacing(1)
 
         number = QLabel(str(day.day))
         number.setObjectName("calendarDayNumber")
         layout.addWidget(number)
 
         dots_host = QWidget()
-        dots_layout = _FlowLayout(dots_host, spacing=2)
+        dots_host.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        dots_layout = _FlowLayout(dots_host, spacing=DOT_SPACING)
         dots_host.setLayout(dots_layout)
         self.dots: List[_RecordingDot] = []
         for entry in entries:
@@ -262,6 +278,12 @@ class _DayCell(QWidget):
         ## END for entry in entries....
 
         layout.addWidget(dots_host, stretch=1)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(32, CELL_HEIGHT)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(24, CELL_HEIGHT)
 
 
 class _MonthGrid(QWidget):
@@ -311,6 +333,11 @@ class _MonthGrid(QWidget):
             grid.setColumnStretch(col, 1)
         ## END for col in range....
 
+        for row in range(1, 7):
+            grid.setRowMinimumHeight(row, CELL_HEIGHT)
+            grid.setRowStretch(row, 1)
+        ## END for row in range....
+
         layout.addLayout(grid)
 
 
@@ -339,7 +366,7 @@ def _weekday_labels(locale: QLocale, first_day_of_week: Qt.DayOfWeek) -> List[st
 
 
 class RecordingCalendarWidget(QScrollArea):
-    """Scrollable stack of month grids with numbered recording dots."""
+    """Scrollable stack of month grids with tiny recording dots."""
 
     dot_clicked = pyqtSignal(int)
 

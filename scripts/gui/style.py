@@ -370,15 +370,14 @@ QLabel#calendarDayNumber {{
     color: {_FG_DIM};
     font-size: 10px;
 }}
-QPushButton#calendarDot {{
-    min-width: 18px;
-    max-width: 18px;
-    min-height: 18px;
-    max-height: 18px;
-    border-radius: 9px;
+QWidget#calendarDot {{
+    background: transparent;
     padding: 0px;
-    font-size: 9px;
-    font-weight: 600;
+    margin: 0px;
+    min-width: 5px;
+    max-width: 5px;
+    min-height: 5px;
+    max-height: 5px;
 }}
 """
 

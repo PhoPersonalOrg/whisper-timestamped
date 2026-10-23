@@ -21,7 +21,7 @@ def normalize_run_when(value: Any) -> str:
 
 
 def normalize_idle_seconds(value: Any) -> int:
-    """Clamp idle delay to the Watch Folders combo choices."""
+    """Clamp idle delay to the Settings combo choices."""
     try:
         seconds = int(value)
     except (TypeError, ValueError):

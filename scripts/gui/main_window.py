@@ -54,8 +54,8 @@ from scripts.gui.calendar_view import (
 from scripts.gui.dialogs import (
     ScanConfigDialog,
     TranscribeConfigDialog,
-    WatchFoldersDialog,
 )
+from scripts.gui.settings_dialog import SettingsDialog, alt_held
 from scripts.gui.folder_watch import FolderWatchWorker
 from scripts.gui.discover_worker import DiscoverTranscriptsWorker
 from scripts.gui.idle import (
@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         self._calendar_refresh_pending: bool = False
 
         # -- Build UI ------------------------------------------------------------
+        self._build_menu()
         self._build_toolbar()
         self._build_table()
         self._build_calendar_dock()
@@ -178,6 +179,16 @@ class MainWindow(QMainWindow):
         self._idle_timer.start()
 
 
+    # ── Menu ─────────────────────────────────────────────────────────────────
+
+    def _build_menu(self) -> None:
+        menu = self.menuBar()
+        settings_menu = menu.addMenu("Settings")
+        settings_action = QAction("Settings…", self)
+        settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        settings_action.triggered.connect(self._on_settings_clicked)
+        settings_menu.addAction(settings_action)
+
     # ── Toolbar ──────────────────────────────────────────────────────────────
 
     def _build_toolbar(self) -> None:
@@ -197,18 +208,24 @@ class MainWindow(QMainWindow):
         load_btn.clicked.connect(self._on_load_csv_clicked)
         toolbar.addWidget(load_btn)
 
-        watch_btn = QPushButton("👁 Watch Folders")
-        watch_btn.clicked.connect(self._on_watch_folders_clicked)
-        toolbar.addWidget(watch_btn)
+        settings_btn = QPushButton("⚙ Settings")
+        settings_btn.clicked.connect(self._on_settings_clicked)
+        toolbar.addWidget(settings_btn)
 
         toolbar.addSeparator()
 
         # Transcribe button
         self._transcribe_btn = QPushButton("🎙 Transcribe Selected")
+        self._transcribe_btn.setToolTip(
+            "Alt-click to choose backend/model for this run"
+        )
         self._transcribe_btn.clicked.connect(self._on_transcribe_selected)
         toolbar.addWidget(self._transcribe_btn)
 
         self._transcribe_all_btn = QPushButton("⏩ Transcribe All Pending")
+        self._transcribe_all_btn.setToolTip(
+            "Alt-click to choose backend/model for this run"
+        )
         self._transcribe_all_btn.clicked.connect(self._on_transcribe_all_pending)
         toolbar.addWidget(self._transcribe_all_btn)
 
@@ -513,7 +530,7 @@ class MainWindow(QMainWindow):
             self,
             on_open=self.show_from_tray,
             on_quit=self._quit_from_tray,
-            on_watch_folders=self._on_watch_folders_clicked,
+            on_settings=self._on_settings_clicked,
             on_auto_transcribe_toggled=self._on_auto_transcribe_toggled,
             on_start_with_windows_toggled=self._on_start_with_windows_toggled,
             auto_transcribe=bool(self._prefs.get("watch_enabled", True)),
@@ -558,10 +575,25 @@ class MainWindow(QMainWindow):
 
         ## END if not ok....
 
-    def _on_watch_folders_clicked(self) -> None:
-        dlg = WatchFoldersDialog(
+    def _on_settings_clicked(self) -> None:
+        dlg = SettingsDialog(
             self._prefs.get("watch_folders") or [],
             auto_transcribe=bool(self._prefs.get("watch_enabled", True)),
+            start_with_windows=is_start_with_windows(),
+            show_autostart=sys.platform == "win32",
+            scan_timezone=str(
+                self._prefs.get("scan_timezone") or "America/Los_Angeles"
+            ),
+            transcribe_backend=str(
+                self._prefs.get("transcribe_backend") or "crisperwhisper"
+            ),
+            transcribe_model=str(self._prefs.get("transcribe_model") or "turbo"),
+            transcribe_crisper_mode=str(
+                self._prefs.get("transcribe_crisper_mode") or "verbatim"
+            ),
+            transcribe_output_dir=str(
+                self._prefs.get("transcribe_output_dir") or ""
+            ),
             run_when=str(self._prefs.get("watch_run_when") or DEFAULT_RUN_WHEN),
             idle_seconds=int(
                 self._prefs.get("watch_idle_seconds") or DEFAULT_IDLE_SECONDS
@@ -578,13 +610,34 @@ class MainWindow(QMainWindow):
         self._prefs["watch_run_when"] = dlg.run_when()
         self._prefs["watch_idle_seconds"] = dlg.idle_seconds()
         self._prefs["watch_low_priority"] = dlg.low_priority()
+        self._prefs["scan_timezone"] = dlg.scan_timezone()
+        self._prefs["transcribe_backend"] = dlg.transcribe_backend()
+        self._prefs["transcribe_model"] = dlg.transcribe_model()
+        self._prefs["transcribe_crisper_mode"] = dlg.transcribe_crisper_mode()
+        self._prefs["transcribe_output_dir"] = dlg.transcribe_output_dir()
         self._save_prefs()
+        if sys.platform == "win32":
+            ok = set_start_with_windows(dlg.start_with_windows())
+            if not ok and dlg.start_with_windows():
+                QMessageBox.warning(
+                    self,
+                    "Start with Windows",
+                    "Could not create a Startup shortcut.",
+                )
+            ## END if not ok....
+
+        ## END if win32....
+
         if self._tray is not None:
             self._tray.set_auto_transcribe(bool(self._prefs["watch_enabled"]))
+            self._tray.set_start_with_windows(is_start_with_windows())
         ## END if self._tray....
 
         self._start_folder_watch()
         self._update_tray_tooltip()
+        if self._prefs.get("watch_enabled", True):
+            self._drain_auto_queue()
+        ## END if watch_enabled....
 
     def _start_folder_watch(self) -> None:
         folders = self._prefs.get("watch_folders") or []
@@ -756,7 +809,9 @@ class MainWindow(QMainWindow):
         ## END for df_index in pending....
 
         self._auto_queue = rest
-        self._start_transcription(same, prompt=False, output_dir=first_out)
+        self._start_transcription(
+            same, prompt=False, origin="auto", output_dir=first_out
+        )
 
     def _watch_run_when(self) -> str:
         return str(self._prefs.get("watch_run_when") or DEFAULT_RUN_WHEN)
@@ -1226,7 +1281,11 @@ class MainWindow(QMainWindow):
                 "Select one or more recordings to transcribe.",
             )
             return
-        self._start_transcription(self._visual_rows_to_df_indices(source_rows))
+        self._start_transcription(
+            self._visual_rows_to_df_indices(source_rows),
+            prompt=alt_held(),
+            origin="manual",
+        )
 
 
     def _on_transcribe_all_pending(self) -> None:
@@ -1252,24 +1311,31 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        self._start_transcription(pending_rows)
+        self._start_transcription(
+            pending_rows, prompt=alt_held(), origin="manual"
+        )
 
 
     def _start_transcription(
         self,
         source_rows: List[int],
         *,
-        prompt: bool = True,
+        prompt: bool = False,
+        origin: str = "manual",
         output_dir: Optional[Path] = None,
     ) -> None:
         """Launch the TranscribeWorker for the given DataFrame indices."""
+        if origin not in ("auto", "manual"):
+            origin = "manual"
+        ## END if origin not auto or manual....
+
         if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
-            if prompt:
+            if origin != "auto":
                 QMessageBox.warning(
                     self, "Already Running",
                     "A transcription is already in progress.",
                 )
-            ## END if prompt....
+            ## END if origin is not auto....
 
             return
 
@@ -1313,23 +1379,21 @@ class MainWindow(QMainWindow):
             self._prefs["transcribe_model"] = model_name
             self._prefs["transcribe_crisper_mode"] = crisper_mode
             self._save_prefs()
-            self._transcribe_origin = "manual"
-            low_priority = False
         else:
             output_dir = Path(output_dir) if output_dir is not None else default_out
             backend = str(self._prefs.get("transcribe_backend") or "crisperwhisper")
             model_name = str(self._prefs.get("transcribe_model") or "turbo")
             crisper_mode = str(self._prefs.get("transcribe_crisper_mode") or "verbatim")
-            self._transcribe_origin = "auto"
-            low_priority = self._watch_low_priority()
         ## END if prompt....
+
+        self._transcribe_origin = origin
+        low_priority = origin == "auto" and self._watch_low_priority()
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Show log dock
         self._log_dock.show()
         self._log_text.clear()
-        origin = "auto" if not prompt else "manual"
         self._log_text.appendPlainText(
             f"Starting {origin} transcription of {len(selected_df)} file(s)…\n"
         )
@@ -1675,7 +1739,9 @@ class MainWindow(QMainWindow):
             transcribe_action = menu.addAction("🎙 Transcribe This File")
             transcribe_action.triggered.connect(
                 lambda: self._start_transcription(
-                    [df_index] if df_index is not None else []
+                    [df_index] if df_index is not None else [],
+                    prompt=alt_held(),
+                    origin="manual",
                 )
             )
         ## END if job_phase....

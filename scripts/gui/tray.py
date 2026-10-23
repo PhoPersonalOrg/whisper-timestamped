@@ -18,7 +18,7 @@ class TrayController:
         *,
         on_open: Callable[[], None],
         on_quit: Callable[[], None],
-        on_watch_folders: Callable[[], None],
+        on_settings: Callable[[], None],
         on_auto_transcribe_toggled: Callable[[bool], None],
         on_start_with_windows_toggled: Callable[[bool], None],
         auto_transcribe: bool = True,
@@ -27,7 +27,7 @@ class TrayController:
     ) -> None:
         self._on_open = on_open
         self._on_quit = on_quit
-        self._on_watch_folders = on_watch_folders
+        self._on_settings = on_settings
         self._on_auto_transcribe_toggled = on_auto_transcribe_toggled
         self._on_start_with_windows_toggled = on_start_with_windows_toggled
         self._show_autostart = show_autostart
@@ -47,9 +47,9 @@ class TrayController:
         self._auto_action.toggled.connect(self._on_auto_transcribe_toggled)
         self._menu.addAction(self._auto_action)
 
-        self._watch_action = QAction("Watch folders…", self._menu)
-        self._watch_action.triggered.connect(self._on_watch_folders)
-        self._menu.addAction(self._watch_action)
+        self._settings_action = QAction("Settings…", self._menu)
+        self._settings_action.triggered.connect(self._on_settings)
+        self._menu.addAction(self._settings_action)
 
         self._autostart_action: Optional[QAction] = None
         if show_autostart:

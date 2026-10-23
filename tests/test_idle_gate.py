@@ -189,13 +189,13 @@ class TestWatchIdlePrefs(unittest.TestCase):
         payload = {
             "scan_audio_dir": "",
             "scan_format_id": "",
-            "scan_timezone": "",
+            "scan_timezone": "America/New_York",
             "scan_csv_path": "",
             "browse_load_csv_dir": "",
-            "transcribe_output_dir": "",
-            "transcribe_backend": "crisperwhisper",
-            "transcribe_model": "turbo",
-            "transcribe_crisper_mode": "verbatim",
+            "transcribe_output_dir": "C:/tmp/transcripts",
+            "transcribe_backend": "openai-whisper",
+            "transcribe_model": "medium.en",
+            "transcribe_crisper_mode": "intended",
             "watch_enabled": True,
             "watch_folders": [],
             "watch_run_when": "always",
@@ -219,6 +219,11 @@ class TestWatchIdlePrefs(unittest.TestCase):
         self.assertEqual(loaded["watch_run_when"], "always")
         self.assertEqual(loaded["watch_idle_seconds"], 120)
         self.assertFalse(loaded["watch_low_priority"])
+        self.assertEqual(loaded["scan_timezone"], "America/New_York")
+        self.assertEqual(loaded["transcribe_backend"], "openai-whisper")
+        self.assertEqual(loaded["transcribe_model"], "medium.en")
+        self.assertEqual(loaded["transcribe_crisper_mode"], "intended")
+        self.assertEqual(loaded["transcribe_output_dir"], "C:/tmp/transcripts")
 
 
 if __name__ == "__main__":

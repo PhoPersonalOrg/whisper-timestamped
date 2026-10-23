@@ -14,6 +14,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.gui.calendar_view import (
+    DOT_SIZE,
     CalendarEntry,
     RecordingCalendarWidget,
     group_calendar_entries,
@@ -91,6 +92,14 @@ class TestRecordingCalendarSelection(unittest.TestCase):
             ]
         )
         return widget
+
+    def test_dots_are_tiny_and_unnumbered(self):
+        widget = self._calendar()
+        self.assertGreaterEqual(len(widget._dots), 1)
+        for dot in widget._dots.values():
+            self.assertEqual(dot.width(), DOT_SIZE)
+            self.assertEqual(dot.height(), DOT_SIZE)
+        ## END for dot in widget._dots.values()....
 
     def test_single_select_scrolls_to_dot(self):
         widget = self._calendar()

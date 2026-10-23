@@ -4,43 +4,24 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView,
-    QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
-    QRadioButton,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
-)
-
-from scripts.gui.idle import (
-    DEFAULT_IDLE_SECONDS,
-    DEFAULT_LOW_PRIORITY,
-    DEFAULT_RUN_WHEN,
-    IDLE_SECONDS_CHOICES,
-    normalize_idle_seconds,
-    normalize_run_when,
 )
 
 from whisper_timestamped.recording_formats import (
     get_format,
     list_format_ids,
-    detect_format,
     RecordingsFormat,
 )
 
@@ -310,234 +291,4 @@ class TranscribeConfigDialog(QDialog):
     def output_dir(self) -> Path:
         text = self._dir_edit.text().strip()
         return Path(text) if text else Path("transcriptions")
-
-
-# -- Watch Folders Dialog ------------------------------------------------------
-
-class WatchFoldersDialog(QDialog):
-    """Enable/disable watched recordings folders and auto-transcribe."""
-
-    def __init__(
-        self,
-        folders: Optional[List[Dict[str, Any]]] = None,
-        *,
-        auto_transcribe: bool = True,
-        run_when: str = DEFAULT_RUN_WHEN,
-        idle_seconds: int = DEFAULT_IDLE_SECONDS,
-        low_priority: bool = DEFAULT_LOW_PRIORITY,
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Watch Folders")
-        self.setMinimumWidth(720)
-        self.setMinimumHeight(460)
-
-        layout = QVBoxLayout(self)
-        self._auto_cb = QCheckBox("Auto-transcribe completed recordings")
-        self._auto_cb.setChecked(auto_transcribe)
-        self._auto_cb.toggled.connect(self._sync_background_enabled)
-        layout.addWidget(self._auto_cb)
-
-        self._bg_group = QGroupBox("Background processing")
-        bg_layout = QVBoxLayout(self._bg_group)
-        self._run_when_group = QButtonGroup(self)
-        self._always_radio = QRadioButton("Whenever files are ready")
-        self._idle_radio = QRadioButton("When this computer is idle")
-        self._run_when_group.addButton(self._always_radio)
-        self._run_when_group.addButton(self._idle_radio)
-        bg_layout.addWidget(self._always_radio)
-        bg_layout.addWidget(self._idle_radio)
-        if normalize_run_when(run_when) == "always":
-            self._always_radio.setChecked(True)
-        else:
-            self._idle_radio.setChecked(True)
-        ## END if run_when is always....
-
-        idle_row = QHBoxLayout()
-        idle_row.addWidget(QLabel("Idle for:"))
-        self._idle_combo = QComboBox()
-        idle_labels = {
-            60: "1 minute",
-            120: "2 minutes",
-            300: "5 minutes",
-            600: "10 minutes",
-            900: "15 minutes",
-        }
-        chosen_idle = normalize_idle_seconds(idle_seconds)
-        for seconds in IDLE_SECONDS_CHOICES:
-            self._idle_combo.addItem(idle_labels[seconds], seconds)
-        ## END for seconds in IDLE_SECONDS_CHOICES....
-
-        idle_idx = self._idle_combo.findData(chosen_idle)
-        if idle_idx >= 0:
-            self._idle_combo.setCurrentIndex(idle_idx)
-        ## END if idle_idx >= 0....
-
-        idle_row.addWidget(self._idle_combo)
-        idle_row.addStretch()
-        bg_layout.addLayout(idle_row)
-
-        self._low_priority_cb = QCheckBox("Run auto-transcribe at low CPU priority")
-        self._low_priority_cb.setChecked(bool(low_priority))
-        bg_layout.addWidget(self._low_priority_cb)
-        self._idle_radio.toggled.connect(self._sync_idle_combo_enabled)
-        layout.addWidget(self._bg_group)
-        self._sync_background_enabled(self._auto_cb.isChecked())
-        self._sync_idle_combo_enabled(self._idle_radio.isChecked())
-
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(
-            ["On", "Format", "Folder", "Recursive"]
-        )
-        self._table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
-        )
-        self._table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self._table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        layout.addWidget(self._table)
-
-        for spec in folders or []:
-            self._add_row(spec)
-        ## END for spec in folders....
-
-        row_btns = QHBoxLayout()
-        add_btn = QPushButton("Add folder…")
-        add_btn.clicked.connect(self._add_folder)
-        remove_btn = QPushButton("Remove")
-        remove_btn.clicked.connect(self._remove_selected)
-        row_btns.addWidget(add_btn)
-        row_btns.addWidget(remove_btn)
-        row_btns.addStretch()
-        layout.addLayout(row_btns)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        save_btn = QPushButton("Save")
-        save_btn.setObjectName("accentButton")
-        save_btn.clicked.connect(self.accept)
-        btn_layout.addWidget(cancel_btn)
-        btn_layout.addWidget(save_btn)
-        layout.addLayout(btn_layout)
-
-    def _add_row(self, spec: Dict[str, Any]) -> None:
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-
-        enabled_item = QTableWidgetItem()
-        enabled_item.setFlags(
-            Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
-        )
-        enabled_item.setCheckState(
-            Qt.CheckState.Checked
-            if spec.get("enabled", True)
-            else Qt.CheckState.Unchecked
-        )
-        self._table.setItem(row, 0, enabled_item)
-
-        format_combo = QComboBox()
-        for fid in list_format_ids():
-            format_combo.addItem(fid, fid)
-        ## END for fid in list_format_ids()....
-
-        format_id = str(spec.get("format_id") or "")
-        idx = format_combo.findData(format_id)
-        if idx >= 0:
-            format_combo.setCurrentIndex(idx)
-        self._table.setCellWidget(row, 1, format_combo)
-
-        path_item = QTableWidgetItem(str(spec.get("path") or ""))
-        self._table.setItem(row, 2, path_item)
-
-        recursive_item = QTableWidgetItem()
-        recursive_item.setFlags(
-            Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
-        )
-        recursive_item.setCheckState(
-            Qt.CheckState.Checked
-            if spec.get("recursive")
-            else Qt.CheckState.Unchecked
-        )
-        self._table.setItem(row, 3, recursive_item)
-
-    def _add_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Select recordings folder", str(Path.home())
-        )
-        if not path:
-            return
-        detected = detect_format(Path(path))
-        format_id = detected.id if detected is not None else "ios_whisper_app"
-        recursive = bool(detected.nest_one_level) if detected is not None else False
-        self._add_row(
-            {
-                "format_id": format_id,
-                "path": path,
-                "enabled": True,
-                "recursive": recursive,
-            }
-        )
-
-    def _remove_selected(self) -> None:
-        row = self._table.currentRow()
-        if row >= 0:
-            self._table.removeRow(row)
-        ## END if row >= 0....
-
-    def _sync_background_enabled(self, enabled: bool) -> None:
-        self._bg_group.setEnabled(bool(enabled))
-
-    def _sync_idle_combo_enabled(self, idle_selected: bool) -> None:
-        self._idle_combo.setEnabled(bool(idle_selected))
-
-    def auto_transcribe(self) -> bool:
-        return self._auto_cb.isChecked()
-
-    def run_when(self) -> str:
-        if self._always_radio.isChecked():
-            return "always"
-        return DEFAULT_RUN_WHEN
-
-    def idle_seconds(self) -> int:
-        data = self._idle_combo.currentData()
-        return normalize_idle_seconds(data if data is not None else DEFAULT_IDLE_SECONDS)
-
-    def low_priority(self) -> bool:
-        return self._low_priority_cb.isChecked()
-
-    def folders(self) -> List[Dict[str, Any]]:
-        result: List[Dict[str, Any]] = []
-        for row in range(self._table.rowCount()):
-            enabled_item = self._table.item(row, 0)
-            path_item = self._table.item(row, 2)
-            recursive_item = self._table.item(row, 3)
-            combo = self._table.cellWidget(row, 1)
-            format_id = ""
-            if isinstance(combo, QComboBox):
-                format_id = str(combo.currentData() or combo.currentText() or "")
-            path = path_item.text().strip() if path_item is not None else ""
-            if not format_id or not path:
-                continue
-            result.append(
-                {
-                    "format_id": format_id,
-                    "path": path,
-                    "enabled": (
-                        enabled_item is not None
-                        and enabled_item.checkState() == Qt.CheckState.Checked
-                    ),
-                    "recursive": (
-                        recursive_item is not None
-                        and recursive_item.checkState() == Qt.CheckState.Checked
-                    ),
-                }
-            )
-        ## END for row in range(self._table.rowCount())....
-
-        return result
 
