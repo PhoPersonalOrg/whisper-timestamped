@@ -45,6 +45,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.gui.audio_player import AudioPlayer
+from scripts.gui.waveform_widget import WaveformPeaksWorker, WaveformWidget
 from scripts.gui.autostart import is_start_with_windows, set_start_with_windows
 from scripts.gui.calendar_view import (
     CalendarEntry,
@@ -107,7 +108,11 @@ from scripts.iOSWhisperAppHelpers.extract_m4a_creation_times import (
 
 def _format_time(seconds: float) -> str:
     """Format seconds as HH:MM:SS for the playback scrubber."""
-    total = int(seconds)
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError, OverflowError):
+        total = 0
+    ## END try seconds....
     h = total // 3600
     m = (total % 3600) // 60
     s = total % 60
@@ -130,6 +135,8 @@ class MainWindow(QMainWindow):
         self._proxy = RecordingFilterProxy(self)
         self._proxy.setSourceModel(self._model)
         self._player = AudioPlayer(self)
+        self._peaks_worker: Optional[WaveformPeaksWorker] = None
+        self._waveform_generation: int = 0
         self._scan_worker: Optional[ScanWorker] = None
         self._transcribe_worker: Optional[TranscribeWorker] = None
         self._discover_worker: Optional[DiscoverTranscriptsWorker] = None
@@ -401,6 +408,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
 
+        self._waveform = WaveformWidget()
+        self._waveform.seek_pressed.connect(self._on_seek_pressed)
+        self._waveform.seek_requested.connect(self._on_waveform_seek)
+        self._waveform.seek_released.connect(self._on_waveform_seek_released)
+        layout.addWidget(self._waveform)
+
         # Transport controls row
         transport = QHBoxLayout()
 
@@ -421,6 +434,7 @@ class MainWindow(QMainWindow):
         self._seek_slider = QSlider(Qt.Orientation.Horizontal)
         self._seek_slider.setRange(0, 0)
         self._seek_slider.sliderPressed.connect(self._on_seek_pressed)
+        self._seek_slider.sliderMoved.connect(self._on_seek_slider_moved)
         self._seek_slider.sliderReleased.connect(self._on_seek_released)
         transport.addWidget(self._seek_slider, stretch=1)
 
@@ -490,6 +504,8 @@ class MainWindow(QMainWindow):
         self._player.position_changed.connect(self._on_position_changed)
         self._player.duration_changed.connect(self._on_duration_changed)
         self._player.state_changed.connect(self._on_player_state_changed)
+        self._player.loaded.connect(self._on_player_loaded)
+        self._player.converting.connect(self._on_player_converting)
         self._player.error.connect(self._on_player_error)
 
 
@@ -1795,7 +1811,16 @@ class MainWindow(QMainWindow):
         # Update transcript preview for the playing row
         self._update_transcript_preview(row_data)
 
+        self._stop_waveform_peaks()
+        self._waveform.set_loading()
         self._player.load(audio_path)
+        if self._player.decode_path is None:
+            self._now_playing.setText("")
+            self._playing_row = -1
+            self._waveform.clear()
+            return
+        ## END if load failed....
+
         self._player.play()
 
 
@@ -2028,9 +2053,22 @@ class MainWindow(QMainWindow):
     def _on_play_pause(self) -> None:
         if self._player.state == "playing":
             self._player.pause()
-        elif self._player.state == "paused":
+            return
+        if self._player.state == "paused":
             self._player.play()
-        elif self._player.state == "stopped" and self._player.current_path:
+            return
+        ## END if playing/paused....
+
+        rows = self._get_selected_source_rows()
+        if rows:
+            row_data = self._model.get_row_data(rows[0])
+            if row_data is not None:
+                self._play_row(row_data, rows[0])
+                return
+            ## END if row_data....
+        ## END if rows....
+
+        if self._player.current_path:
             self._player.play()
 
 
@@ -2040,11 +2078,20 @@ class MainWindow(QMainWindow):
             self._seek_slider.blockSignals(True)
             self._seek_slider.setValue(int(seconds * 10))
             self._seek_slider.blockSignals(False)
+            self._waveform.set_position(seconds)
+        ## END if not seeking....
 
 
     def _on_duration_changed(self, seconds: float) -> None:
+        try:
+            maximum = max(0, int(float(seconds) * 10))
+        except (TypeError, ValueError, OverflowError):
+            seconds = 0.0
+            maximum = 0
+        ## END try slider range....
+
         self._duration_label.setText(_format_time(seconds))
-        self._seek_slider.setRange(0, int(seconds * 10))
+        self._seek_slider.setRange(0, maximum)
 
 
     def _on_player_state_changed(self, state: str) -> None:
@@ -2054,22 +2101,120 @@ class MainWindow(QMainWindow):
             self._play_btn.setText("▶")
 
         if state == "stopped":
-            self._now_playing.setText("")
-            self._playing_row = -1
+            self._waveform.set_position(0.0)
+            if self._player.current_path is None:
+                self._now_playing.setText("")
+                self._playing_row = -1
+            ## END if nothing loaded....
+        ## END if stopped....
+
+
+    def _on_player_loaded(self) -> None:
+        path = self._player.decode_path
+        if path is None:
+            self._waveform.clear()
+            return
+        self._waveform.set_loading()
+        self._start_waveform_peaks(path)
+
+
+    def _on_player_converting(self, msg: str) -> None:
+        self._status_label.setText(msg)
 
 
     def _on_player_error(self, msg: str) -> None:
         self._status_label.setText(f"Playback error: {msg}")
+        if self._player.decode_path is None:
+            self._waveform.clear()
+        ## END if no decode path....
 
 
     def _on_seek_pressed(self) -> None:
         self._is_seeking = True
 
 
+    def _on_seek_slider_moved(self, value: int) -> None:
+        seconds = value / 10.0
+        self._position_label.setText(_format_time(seconds))
+        self._waveform.set_position(seconds)
+
+
     def _on_seek_released(self) -> None:
         self._is_seeking = False
         seconds = self._seek_slider.value() / 10.0
         self._player.seek(seconds)
+
+
+    def _on_waveform_seek(self, seconds: float) -> None:
+        self._position_label.setText(_format_time(seconds))
+        self._seek_slider.blockSignals(True)
+        self._seek_slider.setValue(int(seconds * 10))
+        self._seek_slider.blockSignals(False)
+        self._player.seek(seconds)
+
+
+    def _on_waveform_seek_released(self) -> None:
+        self._is_seeking = False
+
+
+    def _start_waveform_peaks(self, path: Path) -> None:
+        self._stop_waveform_peaks()
+        self._waveform_generation += 1
+        gen = self._waveform_generation
+        self._peaks_worker = WaveformPeaksWorker(path, generation=gen, parent=self)
+        self._peaks_worker.peaks_ready.connect(self._on_waveform_peaks_ready)
+        self._peaks_worker.peaks_failed.connect(self._on_waveform_peaks_failed)
+        self._peaks_worker.start()
+
+
+    def _stop_waveform_peaks(self) -> None:
+        worker = self._peaks_worker
+        if worker is None:
+            return
+        for signal, slot in (
+            (worker.peaks_ready, self._on_waveform_peaks_ready),
+            (worker.peaks_failed, self._on_waveform_peaks_failed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except TypeError:
+                pass
+            ## END try disconnect....
+        ## END for signal, slot....
+
+        worker.request_cancel()
+        if worker.isRunning():
+            worker.wait(1500)
+        ## END if worker.isRunning....
+
+        self._peaks_worker = None
+
+
+    def _on_waveform_peaks_ready(
+        self,
+        mins: object,
+        maxs: object,
+        duration: float,
+        generation: int,
+    ) -> None:
+        if generation != self._waveform_generation:
+            return
+        self._waveform.set_peaks(mins, maxs, duration)
+
+
+    def _on_waveform_peaks_failed(self, message: str, generation: int) -> None:
+        if generation != self._waveform_generation:
+            return
+        duration = self._player.duration
+        if duration > 0:
+            self._waveform.set_placeholder(duration)
+        else:
+            self._waveform.clear()
+        ## END if duration....
+
+        if message:
+            self._status_label.setText(f"Waveform error: {message}")
+        ## END if message....
 
 
     # -- Status bar ------------------------------------------------------------
@@ -2101,6 +2246,7 @@ class MainWindow(QMainWindow):
         ## END if hide to tray....
 
         self._save_prefs()
+        self._stop_waveform_peaks()
         self._player.cleanup()
         self._stop_transcript_discovery()
         if self._watch_worker is not None and self._watch_worker.isRunning():

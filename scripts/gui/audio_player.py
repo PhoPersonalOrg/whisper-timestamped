@@ -16,7 +16,12 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QObject, QTimer, pyqtSignal
+
+
+# libsndfile cannot decode these containers; always extract audio via ffmpeg.
+_VIDEO_SUFFIXES = {".mkv", ".mp4", ".webm", ".avi", ".mov", ".m4v"}
+_MAX_FRAMES = 10**10
 
 
 class AudioPlayer(QObject):
@@ -25,6 +30,8 @@ class AudioPlayer(QObject):
     position_changed = pyqtSignal(float)   # current position in seconds
     duration_changed = pyqtSignal(float)   # total duration in seconds
     state_changed = pyqtSignal(str)        # "playing" / "paused" / "stopped"
+    loaded = pyqtSignal()                  # decode_path is ready for peak extraction
+    converting = pyqtSignal(str)           # status text while ffmpeg is extracting
     error = pyqtSignal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
@@ -39,6 +46,7 @@ class AudioPlayer(QObject):
         self._channels: int = 1
         self._state: str = "stopped"
         self._loaded_path: Optional[Path] = None
+        self._decode_path: Optional[Path] = None
         self._temp_wav: Optional[Path] = None
 
         # Timer to emit position updates while playing
@@ -50,34 +58,41 @@ class AudioPlayer(QObject):
     def load(self, path: Path) -> None:
         """Load an audio file for playback."""
         self.stop()
+        self._close_soundfile()
         self._cleanup_temp()
+        self._decode_path = None
+        self._loaded_path = None
 
-        resolved = Path(path)
-        # Try opening directly with soundfile
-        try:
-            sfile = sf.SoundFile(str(resolved))
-        except (sf.LibsndfileError, RuntimeError):
-            # libsndfile can't decode — try ffmpeg conversion to WAV
-            resolved = self._convert_to_wav(resolved)
+        source = Path(path)
+        sfile = None
+        resolved = source
+        if source.suffix.lower() not in _VIDEO_SUFFIXES:
+            sfile = self._try_open_soundfile(source)
+        ## END if not a video container....
+
+        if sfile is None:
+            resolved = self._convert_to_wav(source)
             if resolved is None:
                 return
-            try:
-                sfile = sf.SoundFile(str(resolved))
-            except Exception as exc:
-                self.error.emit(f"Cannot open audio: {exc}")
+            sfile = self._try_open_soundfile(resolved)
+            if sfile is None:
+                self.error.emit(f"Cannot open audio: {source.name}")
                 return
-        ## END try open soundfile...
+            ## END if converted wav unreadable....
+        ## END if native open failed....
 
         self._sf = sfile
-        self._samplerate = sfile.samplerate
-        self._channels = sfile.channels
-        self._total_frames = sfile.frames
+        self._samplerate = int(sfile.samplerate)
+        self._channels = int(sfile.channels)
+        self._total_frames = int(sfile.frames)
         self._position_frames = 0
-        self._loaded_path = Path(path)
+        self._loaded_path = source
+        self._decode_path = Path(resolved)
 
         duration = self._total_frames / self._samplerate
         self.duration_changed.emit(duration)
         self._set_state("stopped")
+        self.loaded.emit()
 
 
     def play(self) -> None:
@@ -163,6 +178,12 @@ class AudioPlayer(QObject):
 
 
     @property
+    def decode_path(self) -> Optional[Path]:
+        """Path actually opened for PCM (original file or ffmpeg temp WAV)."""
+        return self._decode_path
+
+
+    @property
     def duration(self) -> float:
         if self._total_frames > 0 and self._samplerate > 0:
             return self._total_frames / self._samplerate
@@ -177,10 +198,10 @@ class AudioPlayer(QObject):
     def cleanup(self) -> None:
         """Release all resources. Call on application exit."""
         self.stop()
-        if self._sf is not None:
-            self._sf.close()
-            self._sf = None
+        self._close_soundfile()
         self._cleanup_temp()
+        self._decode_path = None
+        self._loaded_path = None
 
 
     # -- Private ---------------------------------------------------------------
@@ -236,8 +257,46 @@ class AudioPlayer(QObject):
         self.state_changed.emit(state)
 
 
+    def _close_soundfile(self) -> None:
+        """Close the playback SoundFile if open."""
+        with self._lock:
+            if self._sf is None:
+                return
+            try:
+                self._sf.close()
+            except Exception:
+                pass
+            self._sf = None
+        ## END with lock....
+
+
+    def _try_open_soundfile(self, path: Path) -> Optional[sf.SoundFile]:
+        """Open *path* if libsndfile can decode a finite PCM stream."""
+        try:
+            sfile = sf.SoundFile(str(path))
+        except Exception:
+            return None
+        frames = int(getattr(sfile, "frames", 0) or 0)
+        samplerate = int(getattr(sfile, "samplerate", 0) or 0)
+        if samplerate <= 0 or frames <= 0 or frames > _MAX_FRAMES:
+            try:
+                sfile.close()
+            except Exception:
+                pass
+            return None
+        ## END if unusable stream....
+
+        return sfile
+
+
     def _convert_to_wav(self, source: Path) -> Optional[Path]:
-        """Convert audio to WAV via ffmpeg. Returns temp WAV path or None."""
+        """Extract audio to WAV via ffmpeg. Returns temp WAV path or None."""
+        self.converting.emit(f"Extracting audio from {source.name}…")
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.processEvents()
+        ## END if processEvents....
+
         try:
             tmp = tempfile.NamedTemporaryFile(
                 suffix=".wav", delete=False, prefix="arm_playback_"
@@ -246,17 +305,29 @@ class AudioPlayer(QObject):
             self._temp_wav = Path(tmp.name)
             subprocess.run(
                 [
-                    "ffmpeg", "-y", "-i", str(source),
-                    "-acodec", "pcm_s16le", "-ar", "44100",
+                    "ffmpeg", "-nostdin", "-hide_banner", "-y",
+                    "-i", str(source),
+                    "-vn", "-ac", "2", "-ar", "44100",
+                    "-acodec", "pcm_s16le",
                     str(self._temp_wav),
                 ],
                 capture_output=True,
                 check=True,
-                timeout=120,
+                timeout=600,
             )
             return self._temp_wav
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            self.error.emit(f"ffmpeg conversion failed for {source.name}: {exc}")
+        except FileNotFoundError:
+            self.error.emit("ffmpeg not found on PATH — needed to play this file")
+            self._cleanup_temp()
+            return None
+        except subprocess.TimeoutExpired:
+            self.error.emit(f"ffmpeg timed out extracting audio from {source.name}")
+            self._cleanup_temp()
+            return None
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+            detail = stderr.splitlines()[-1] if stderr else str(exc)
+            self.error.emit(f"ffmpeg failed for {source.name}: {detail}")
             self._cleanup_temp()
             return None
 
