@@ -543,7 +543,7 @@ def process_recordings(
     n_jobs = len(jobs)
     try:
         from whisper_timestamped.crisperwhisper.longform.progress import (
-            set_audio_progress_callback,
+            audio_progress_hook,
         )
 
         for job_i, (audio_path, base_name, persist_idx, callback_idx) in enumerate(jobs, start=1):
@@ -609,8 +609,7 @@ def process_recordings(
                     print(f"  First file load_audio: {time.perf_counter() - t0_audio:.1f}s")
 
                 t0_transcribe = time.perf_counter()
-                set_audio_progress_callback(_progress_hook if on_progress else None)
-                try:
+                with audio_progress_hook(_progress_hook if on_progress else None):
                     result = whisper.transcribe(
                         model,
                         audio,
@@ -619,9 +618,7 @@ def process_recordings(
                         remove_empty_words=True,
                         crisper_mode=crisper_mode,
                     )
-                finally:
-                    set_audio_progress_callback(None)
-                ## END try transcribe with progress hook...
+                ## END with audio_progress_hook....
 
                 if first_file_timed:
                     print(f"  First file transcribe: {time.perf_counter() - t0_transcribe:.1f}s")

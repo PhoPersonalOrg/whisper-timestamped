@@ -1,9 +1,12 @@
-"""Unit tests for playback-dock waveform peaks, seek mapping, and stale workers."""
+"""Unit tests for playback-dock waveform peaks, cache, and prefetch."""
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -18,9 +21,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.gui.audio_player import AudioPlayer
+from scripts.gui.waveform_cache import (
+    WaveformCache,
+    WaveformPrefetchWorker,
+    extract_peaks,
+)
 from scripts.gui.waveform_widget import (
     WAVEFORM_HEIGHT,
-    WaveformPeaksWorker,
     WaveformWidget,
     downsample_peaks,
 )
@@ -38,6 +45,13 @@ def _app() -> QApplication:
 
 def _write_wav(path: Path, data: np.ndarray, samplerate: int = SR) -> None:
     sf.write(str(path), data, samplerate, subtype="FLOAT")
+
+
+def _tone_wav(path: Path, seconds: float = 0.25) -> Path:
+    n = max(1, int(SR * seconds))
+    t = np.linspace(0, seconds, n, endpoint=False, dtype=np.float32)
+    _write_wav(path, (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32))
+    return path
 
 
 class TestDownsamplePeaks(unittest.TestCase):
@@ -120,39 +134,112 @@ class TestWaveformSeekMapping(unittest.TestCase):
         widget.close()
 
 
-class TestStaleWaveformWorker(unittest.TestCase):
+class TestWaveformCache(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.calls: list[str] = []
+
+        def extract(path: Path, cancel_check=None) -> tuple:
+            self.calls.append(Path(path).name)
+            mins = np.full(4, -0.4, dtype=np.float32)
+            maxs = np.full(4, 0.4, dtype=np.float32)
+            return mins, maxs, 1.25
+
+        self.cache = WaveformCache(cache_dir=self.dir / "cache", extract_fn=extract)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_disk_cache_hit_skips_extract(self):
+        wav = _tone_wav(self.dir / "clip.wav")
+        first = self.cache.get_or_extract(wav)
+        self.assertEqual(self.calls, ["clip.wav"])
+        self.assertTrue(self.cache.cache_file(wav).is_file())
+        second = self.cache.get(wav)
+        self.assertIsNotNone(second)
+        self.assertEqual(self.calls, ["clip.wav"])
+        self.assertAlmostEqual(first[2], 1.25, places=5)
+        self.assertAlmostEqual(second[2], 1.25, places=5)
+
+    def test_stale_mtime_recomputes(self):
+        wav = _tone_wav(self.dir / "clip.wav")
+        self.cache.get_or_extract(wav)
+        self.assertEqual(self.calls, ["clip.wav"])
+        later = time.time() + 5
+        os.utime(wav, (later, later))
+        self.assertIsNone(self.cache.get(wav))
+        self.cache.get_or_extract(wav)
+        self.assertEqual(self.calls, ["clip.wav", "clip.wav"])
+
+    def test_native_wav_extract_does_not_invoke_ffmpeg(self):
+        wav = _tone_wav(self.dir / "tone.wav", seconds=0.5)
+
+        def boom(*args, **kwargs):
+            raise AssertionError("ffmpeg should not be called for a native WAV")
+
+        mins, maxs, duration = extract_peaks(wav, n_bins=N_BINS, ffmpeg_popen=boom)
+        self.assertGreater(len(mins), 0)
+        self.assertGreater(duration, 0.4)
+
+    def test_garbage_mkv_extract_fails_without_cache(self):
+        path = self.dir / "clip.mkv"
+        path.write_bytes(b"not a matroska file")
+        real_cache = WaveformCache(cache_dir=self.dir / "mkv-cache")
+        with self.assertRaises(Exception):
+            real_cache.get_or_extract(path)
+        self.assertIsNone(real_cache.get(path))
+        self.assertFalse(real_cache.cache_file(path).is_file())
+
+
+class TestWaveformPrefetchPrioritize(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = _app()
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self._tmp.name) / "tone.wav"
-        t = np.linspace(0, 0.25, SR // 4, endpoint=False, dtype=np.float32)
-        _write_wav(self.path, (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32))
+        self.dir = Path(self._tmp.name)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _run_worker(self, generation: int, current_gen: int) -> list[int]:
-        applied: list[int] = []
+    def test_prioritize_runs_bumped_path_next(self):
+        names = ("a.wav", "b.wav", "c.wav")
+        paths = [_tone_wav(self.dir / name, seconds=0.05) for name in names]
+        order: list[str] = []
+        started = threading.Event()
+        release = threading.Event()
 
-        def on_ready(mins, maxs, duration, result_gen: int) -> None:
-            if result_gen != current_gen:
-                return
-            applied.append(result_gen)
+        def extract(path: Path, cancel_check=None) -> tuple:
+            order.append(Path(path).name)
+            if len(order) == 1:
+                started.set()
+                release.wait(timeout=3)
+            ## END if first extract....
 
-        worker = WaveformPeaksWorker(self.path, generation=generation, n_bins=N_BINS)
-        worker.peaks_ready.connect(on_ready, Qt.ConnectionType.DirectConnection)
+            mins = np.full(4, -0.1, dtype=np.float32)
+            maxs = np.full(4, 0.1, dtype=np.float32)
+            return mins, maxs, 0.05
+
+        cache = WaveformCache(cache_dir=self.dir / "cache", extract_fn=extract)
+        worker = WaveformPrefetchWorker(cache)
+        worker.set_paths(paths)
         worker.start()
-        self.assertTrue(worker.wait(10000))
-        return applied
+        self.assertTrue(started.wait(timeout=3))
+        worker.prioritize(paths[2])
+        release.set()
+        deadline = time.time() + 5
+        while len(order) < 3 and time.time() < deadline:
+            self.app.processEvents()
+            time.sleep(0.03)
+        ## END while waiting for queue....
 
-    def test_stale_generation_is_ignored(self):
-        self.assertEqual(self._run_worker(generation=1, current_gen=2), [])
-
-    def test_current_generation_is_applied(self):
-        self.assertEqual(self._run_worker(generation=2, current_gen=2), [2])
+        worker.request_cancel()
+        self.assertTrue(worker.wait(3000))
+        self.assertEqual(order[0], "a.wav")
+        self.assertEqual(order[1], "c.wav")
+        self.assertEqual(sorted(order), ["a.wav", "b.wav", "c.wav"])
 
 
 class TestAudioPlayerLoad(unittest.TestCase):
@@ -170,9 +257,7 @@ class TestAudioPlayerLoad(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_load_wav_sets_decode_path_without_ffmpeg(self):
-        path = self.dir / "tone.wav"
-        t = np.linspace(0, 0.25, SR // 4, endpoint=False, dtype=np.float32)
-        _write_wav(path, (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32))
+        path = _tone_wav(self.dir / "tone.wav")
         converting: list[str] = []
         self.player.converting.connect(converting.append)
         self.player.load(path)

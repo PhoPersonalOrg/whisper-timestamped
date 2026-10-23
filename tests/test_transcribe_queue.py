@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import io
 import sys
+import types
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm as TqdmClass
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -24,6 +26,7 @@ from scripts.transcribe_queue import (
 )
 from whisper_timestamped.crisperwhisper.longform.progress import (
     audio_progress_bar,
+    audio_progress_hook,
     set_audio_progress_callback,
 )
 
@@ -109,6 +112,34 @@ class TestAudioProgressCallback(unittest.TestCase):
         self.assertIn(0.25, seen)
         self.assertEqual(seen[-1], 0.5)
         self.assertNotIn(0.0, seen)
+
+    def test_openai_whisper_tqdm_hook_reports_fraction(self):
+        fake_tqdm_ns = types.SimpleNamespace(tqdm=TqdmClass)
+        fake_mod = types.ModuleType("whisper.transcribe")
+        fake_mod.tqdm = fake_tqdm_ns
+        prev = sys.modules.get("whisper.transcribe")
+        sys.modules["whisper.transcribe"] = fake_mod
+        seen = []
+        try:
+            with audio_progress_hook(seen.append):
+                self.assertEqual(fake_mod.tqdm.tqdm.__name__, "_CallbackTqdm")
+                with redirect_stderr(io.StringIO()):
+                    pbar = fake_mod.tqdm.tqdm(total=100, unit="frames", disable=False)
+                    pbar.update(40)
+                    pbar.close()
+                ## END with redirect_stderr....
+
+            ## END with audio_progress_hook....
+
+            self.assertIn(0.4, seen)
+            self.assertIs(fake_mod.tqdm.tqdm, TqdmClass)
+        finally:
+            if prev is None:
+                sys.modules.pop("whisper.transcribe", None)
+            else:
+                sys.modules["whisper.transcribe"] = prev
+            set_audio_progress_callback(None)
+        ## END try restore whisper.transcribe....
 
 
 if __name__ == "__main__":

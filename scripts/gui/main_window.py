@@ -45,7 +45,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.gui.audio_player import AudioPlayer
-from scripts.gui.waveform_widget import WaveformPeaksWorker, WaveformWidget
+from scripts.gui.waveform_cache import WaveformCache, WaveformPrefetchWorker
+from scripts.gui.waveform_widget import WaveformWidget
 from scripts.gui.autostart import is_start_with_windows, set_start_with_windows
 from scripts.gui.calendar_view import (
     CalendarEntry,
@@ -135,8 +136,10 @@ class MainWindow(QMainWindow):
         self._proxy = RecordingFilterProxy(self)
         self._proxy.setSourceModel(self._model)
         self._player = AudioPlayer(self)
-        self._peaks_worker: Optional[WaveformPeaksWorker] = None
-        self._waveform_generation: int = 0
+        self._waveform_cache = WaveformCache()
+        self._prefetch_worker: Optional[WaveformPrefetchWorker] = None
+        self._waveform_source: Optional[Path] = None
+        self._player_position: float = 0.0
         self._scan_worker: Optional[ScanWorker] = None
         self._transcribe_worker: Optional[TranscribeWorker] = None
         self._discover_worker: Optional[DiscoverTranscriptsWorker] = None
@@ -504,7 +507,6 @@ class MainWindow(QMainWindow):
         self._player.position_changed.connect(self._on_position_changed)
         self._player.duration_changed.connect(self._on_duration_changed)
         self._player.state_changed.connect(self._on_player_state_changed)
-        self._player.loaded.connect(self._on_player_loaded)
         self._player.converting.connect(self._on_player_converting)
         self._player.error.connect(self._on_player_error)
 
@@ -722,6 +724,7 @@ class MainWindow(QMainWindow):
         df_index = self._upsert_watched_recording(format_id, path)
         if df_index is None:
             return
+        self._enqueue_waveform_path(path)
         self._enqueue_auto_transcribe(df_index)
 
     def _enqueue_auto_transcribe(self, df_index: int) -> None:
@@ -1053,6 +1056,7 @@ class MainWindow(QMainWindow):
         self._auto_size_columns()
         QTimer.singleShot(0, self._auto_size_columns)
         self._start_transcript_discovery()
+        self._start_waveform_prefetch()
 
 
     def _discovery_jobs_from_model(self) -> List[dict]:
@@ -1597,6 +1601,7 @@ class MainWindow(QMainWindow):
         self._transcribe_origin = ""
         self._update_tray_tooltip()
         QTimer.singleShot(0, self._drain_auto_queue)
+        self._start_waveform_prefetch()
 
 
     def _on_transcription_error(self, msg: str) -> None:
@@ -1615,6 +1620,7 @@ class MainWindow(QMainWindow):
         ## END if origin != auto....
 
         QTimer.singleShot(0, self._drain_auto_queue)
+        self._start_waveform_prefetch()
 
 
     def _save_affected_csv(self, df_index: int) -> None:
@@ -1784,25 +1790,14 @@ class MainWindow(QMainWindow):
 
     def _play_row(self, row_data: pd.Series, visual_row: int) -> None:
         """Load and play audio for a row."""
-        full_path = row_data.get("full_path", "")
-        if pd.isna(full_path) or not str(full_path).strip():
-            return
-
-        audio_path = Path(str(full_path).strip())
-        # Handle WSL paths
-        if not audio_path.is_file() and str(audio_path).startswith("/mnt/"):
-            import re
-            m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(audio_path))
-            if m:
-                audio_path = Path(f"{m.group(1).upper()}:/{m.group(2)}")
-        ## END if WSL path...
-
-        if not audio_path.is_file():
+        audio_path = self._resolve_media_path(row_data.get("full_path", ""))
+        if audio_path is None:
             QMessageBox.warning(
                 self, "File Not Found",
-                f"Audio file not found:\n{audio_path}",
+                f"Audio file not found:\n{row_data.get('full_path', '')}",
             )
             return
+        ## END if missing file....
 
         name = row_data.get("name", audio_path.name)
         self._now_playing.setText(f"Now playing: {name}")
@@ -1810,14 +1805,12 @@ class MainWindow(QMainWindow):
 
         # Update transcript preview for the playing row
         self._update_transcript_preview(row_data)
+        self._show_waveform_for_path(audio_path)
 
-        self._stop_waveform_peaks()
-        self._waveform.set_loading()
         self._player.load(audio_path)
         if self._player.decode_path is None:
             self._now_playing.setText("")
             self._playing_row = -1
-            self._waveform.clear()
             return
         ## END if load failed....
 
@@ -1848,6 +1841,12 @@ class MainWindow(QMainWindow):
 
         row_data = self._model.get_row_data(source_idx.row())
         self._update_transcript_preview(row_data)
+        if row_data is not None:
+            media_path = self._resolve_media_path(row_data.get("full_path", ""))
+            if media_path is not None:
+                self._show_waveform_for_path(media_path)
+            ## END if media_path....
+        ## END if row_data....
 
 
     def _visible_calendar_entries(self) -> List[CalendarEntry]:
@@ -2073,12 +2072,15 @@ class MainWindow(QMainWindow):
 
 
     def _on_position_changed(self, seconds: float) -> None:
+        self._player_position = seconds
         self._position_label.setText(_format_time(seconds))
         if not self._is_seeking:
             self._seek_slider.blockSignals(True)
             self._seek_slider.setValue(int(seconds * 10))
             self._seek_slider.blockSignals(False)
-            self._waveform.set_position(seconds)
+            if self._waveform_matches_player():
+                self._waveform.set_position(seconds)
+            ## END if waveform matches player....
         ## END if not seeking....
 
 
@@ -2101,21 +2103,16 @@ class MainWindow(QMainWindow):
             self._play_btn.setText("▶")
 
         if state == "stopped":
-            self._waveform.set_position(0.0)
+            self._player_position = 0.0
+            if self._waveform_matches_player():
+                self._waveform.set_position(0.0)
+            ## END if waveform matches player....
+
             if self._player.current_path is None:
                 self._now_playing.setText("")
                 self._playing_row = -1
             ## END if nothing loaded....
         ## END if stopped....
-
-
-    def _on_player_loaded(self) -> None:
-        path = self._player.decode_path
-        if path is None:
-            self._waveform.clear()
-            return
-        self._waveform.set_loading()
-        self._start_waveform_peaks(path)
 
 
     def _on_player_converting(self, msg: str) -> None:
@@ -2124,9 +2121,6 @@ class MainWindow(QMainWindow):
 
     def _on_player_error(self, msg: str) -> None:
         self._status_label.setText(f"Playback error: {msg}")
-        if self._player.decode_path is None:
-            self._waveform.clear()
-        ## END if no decode path....
 
 
     def _on_seek_pressed(self) -> None:
@@ -2136,7 +2130,9 @@ class MainWindow(QMainWindow):
     def _on_seek_slider_moved(self, value: int) -> None:
         seconds = value / 10.0
         self._position_label.setText(_format_time(seconds))
-        self._waveform.set_position(seconds)
+        if self._waveform_matches_player():
+            self._waveform.set_position(seconds)
+        ## END if waveform matches player....
 
 
     def _on_seek_released(self) -> None:
@@ -2157,23 +2153,127 @@ class MainWindow(QMainWindow):
         self._is_seeking = False
 
 
-    def _start_waveform_peaks(self, path: Path) -> None:
-        self._stop_waveform_peaks()
-        self._waveform_generation += 1
-        gen = self._waveform_generation
-        self._peaks_worker = WaveformPeaksWorker(path, generation=gen, parent=self)
-        self._peaks_worker.peaks_ready.connect(self._on_waveform_peaks_ready)
-        self._peaks_worker.peaks_failed.connect(self._on_waveform_peaks_failed)
-        self._peaks_worker.start()
+    def _resolve_media_path(self, full_path) -> Optional[Path]:
+        if pd.isna(full_path) or not str(full_path).strip():
+            return None
+        audio_path = Path(str(full_path).strip())
+        if audio_path.is_file():
+            return audio_path
+        if str(audio_path).startswith("/mnt/"):
+            m = re.match(r"^/mnt/([a-zA-Z])/(.*)$", str(audio_path))
+            if m:
+                audio_path = Path(f"{m.group(1).upper()}:/{m.group(2)}")
+                if audio_path.is_file():
+                    return audio_path
+                ## END if converted wsl path exists....
+            ## END if wsl match....
+        ## END if /mnt/....
+
+        return None
 
 
-    def _stop_waveform_peaks(self) -> None:
-        worker = self._peaks_worker
+    def _waveform_matches_player(self) -> bool:
+        if self._waveform_source is None or self._player.current_path is None:
+            return False
+        try:
+            return self._waveform_source.resolve() == Path(self._player.current_path).resolve()
+        except OSError:
+            return self._waveform_source == Path(self._player.current_path)
+        ## END try resolve....
+
+
+    def _show_waveform_for_path(self, path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        ## END try resolve....
+
+        same = self._waveform_source is not None and self._waveform_source == resolved
+        self._waveform_source = resolved
+        hit = self._waveform_cache.get(path)
+        if hit is not None:
+            mins, maxs, duration = hit
+            self._waveform.set_peaks(mins, maxs, duration)
+            if self._waveform_matches_player():
+                self._waveform.set_position(self._player_position)
+            elif not same:
+                self._waveform.set_position(0.0)
+            ## END if playhead....
+
+            return
+        ## END if cache hit....
+
+        if not same:
+            self._waveform.set_loading()
+        ## END if new path....
+
+        self._enqueue_waveform_path(path, prioritize=True)
+
+
+    def _waveform_paths_from_model(self) -> List[Path]:
+        df = self._model.get_dataframe()
+        if df.empty or "full_path" not in df.columns:
+            return []
+        paths: List[Path] = []
+        seen: Set[str] = set()
+        for val in df["full_path"]:
+            path = self._resolve_media_path(val)
+            if path is None:
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
+        ## END for val in df["full_path"]....
+
+        return paths
+
+
+    def _enqueue_waveform_path(self, path: Path, prioritize: bool = False) -> None:
+        worker = self._prefetch_worker
+        if worker is not None and worker.isRunning():
+            if prioritize:
+                worker.prioritize(path)
+            else:
+                worker.enqueue(path)
+            ## END if prioritize....
+
+            return
+        ## END if worker running....
+
+        self._start_waveform_prefetch()
+        worker = self._prefetch_worker
+        if worker is not None and prioritize:
+            worker.prioritize(path)
+        ## END if prioritize after start....
+
+
+    def _start_waveform_prefetch(self) -> None:
+        self._stop_waveform_prefetch()
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            return
+        paths = self._waveform_paths_from_model()
+        if not paths:
+            return
+        self._prefetch_worker = WaveformPrefetchWorker(self._waveform_cache, parent=self)
+        self._prefetch_worker.peaks_ready.connect(self._on_waveform_prefetch_ready)
+        self._prefetch_worker.peaks_failed.connect(self._on_waveform_prefetch_failed)
+        self._prefetch_worker.progress.connect(self._on_waveform_prefetch_progress)
+        self._prefetch_worker.set_paths(paths)
+        self._prefetch_worker.start()
+        self._prefetch_worker.setPriority(QThread.Priority.LowestPriority)
+
+
+    def _stop_waveform_prefetch(self) -> None:
+        worker = self._prefetch_worker
         if worker is None:
             return
         for signal, slot in (
-            (worker.peaks_ready, self._on_waveform_peaks_ready),
-            (worker.peaks_failed, self._on_waveform_peaks_failed),
+            (worker.peaks_ready, self._on_waveform_prefetch_ready),
+            (worker.peaks_failed, self._on_waveform_prefetch_failed),
+            (worker.progress, self._on_waveform_prefetch_progress),
         ):
             try:
                 signal.disconnect(slot)
@@ -2187,34 +2287,57 @@ class MainWindow(QMainWindow):
             worker.wait(1500)
         ## END if worker.isRunning....
 
-        self._peaks_worker = None
+        self._prefetch_worker = None
 
 
-    def _on_waveform_peaks_ready(
+    def _on_waveform_prefetch_ready(
         self,
+        path_str: str,
         mins: object,
         maxs: object,
         duration: float,
-        generation: int,
     ) -> None:
-        if generation != self._waveform_generation:
+        if self._waveform_source is None:
+            return
+        try:
+            ready = Path(path_str).resolve()
+            current = self._waveform_source.resolve()
+        except OSError:
+            ready = Path(path_str)
+            current = self._waveform_source
+        ## END try resolve....
+
+        if ready != current:
             return
         self._waveform.set_peaks(mins, maxs, duration)
+        if self._waveform_matches_player():
+            self._waveform.set_position(self._player_position)
+        ## END if playhead....
 
 
-    def _on_waveform_peaks_failed(self, message: str, generation: int) -> None:
-        if generation != self._waveform_generation:
+    def _on_waveform_prefetch_failed(self, path_str: str, message: str) -> None:
+        if self._waveform_source is None:
             return
-        duration = self._player.duration
-        if duration > 0:
-            self._waveform.set_placeholder(duration)
-        else:
-            self._waveform.clear()
-        ## END if duration....
+        try:
+            failed = Path(path_str).resolve()
+            current = self._waveform_source.resolve()
+        except OSError:
+            failed = Path(path_str)
+            current = self._waveform_source
+        ## END try resolve....
 
+        if failed != current:
+            return
+        self._waveform.clear()
         if message:
             self._status_label.setText(f"Waveform error: {message}")
         ## END if message....
+
+
+    def _on_waveform_prefetch_progress(self, msg: str) -> None:
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            return
+        self._status_label.setText(msg)
 
 
     # -- Status bar ------------------------------------------------------------
@@ -2246,7 +2369,7 @@ class MainWindow(QMainWindow):
         ## END if hide to tray....
 
         self._save_prefs()
-        self._stop_waveform_peaks()
+        self._stop_waveform_prefetch()
         self._player.cleanup()
         self._stop_transcript_discovery()
         if self._watch_worker is not None and self._watch_worker.isRunning():

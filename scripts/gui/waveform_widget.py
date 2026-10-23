@@ -12,7 +12,7 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
-from PyQt6.QtCore import QPointF, QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QPointF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
@@ -66,47 +66,6 @@ def downsample_peaks(
     mins[empty] = 0.0
     maxs[empty] = 0.0
     return mins, maxs, duration
-
-
-class WaveformPeaksWorker(QThread):
-    """Compute a peak envelope off the GUI thread."""
-
-    peaks_ready = pyqtSignal(object, object, float, int)  # mins, maxs, duration, generation
-    peaks_failed = pyqtSignal(str, int)
-
-    def __init__(
-        self,
-        path: Path,
-        generation: int,
-        n_bins: int = DEFAULT_N_BINS,
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self.path = Path(path)
-        self.generation = int(generation)
-        self.n_bins = n_bins
-        self._cancel_requested = False
-
-    def request_cancel(self) -> None:
-        self._cancel_requested = True
-
-    def run(self) -> None:
-        try:
-            mins, maxs, duration = downsample_peaks(
-                self.path,
-                n_bins=self.n_bins,
-                cancel_check=lambda: self._cancel_requested,
-            )
-            if self._cancel_requested:
-                return
-            self.peaks_ready.emit(mins, maxs, duration, self.generation)
-        except InterruptedError:
-            return
-        except Exception as exc:
-            if not self._cancel_requested:
-                self.peaks_failed.emit(str(exc), self.generation)
-            ## END if not cancelled....
-        ## END try peak extraction....
 
 
 class WaveformWidget(QWidget):
@@ -222,7 +181,7 @@ class WaveformWidget(QWidget):
         ## END if loading....
 
         if self._mins is None or self._maxs is None or len(self._mins) == 0:
-            self._draw_message(painter, "Double-click a recording to play")
+            self._draw_message(painter, "Select a recording")
             painter.end()
             return
         ## END if no peaks....

@@ -209,25 +209,30 @@ class TranscribeConfigDialog(QDialog):
         self._backend_combo = QComboBox()
         self._backend_combo.addItem("CrisperWhisper", "crisperwhisper")
         self._backend_combo.addItem("OpenAI Whisper", "openai-whisper")
-        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
-        idx = self._backend_combo.findData(initial_backend)
-        if idx >= 0:
-            self._backend_combo.setCurrentIndex(idx)
         form.addRow("Backend:", self._backend_combo)
 
         # Model
         self._model_edit = QLineEdit("turbo")
         form.addRow("Model:", self._model_edit)
 
-        # CrisperWhisper mode
+        # CrisperWhisper mode — create before connecting backend, because
+        # setCurrentIndex fires _on_backend_changed immediately.
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("Verbatim", "verbatim")
         self._mode_combo.addItem("Intended", "intended")
         mode_idx = self._mode_combo.findData(initial_crisper_mode)
         if mode_idx >= 0:
             self._mode_combo.setCurrentIndex(mode_idx)
+        ## END if mode_idx >= 0....
+
         self._mode_label = QLabel("CrisperWhisper Mode:")
         form.addRow(self._mode_label, self._mode_combo)
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        idx = self._backend_combo.findData(initial_backend)
+        if idx >= 0:
+            self._backend_combo.setCurrentIndex(idx)
+        ## END if idx >= 0....
+
         self._on_backend_changed(self._backend_combo.currentIndex())
         self._model_edit.setText(initial_model or "turbo")
 
@@ -257,6 +262,8 @@ class TranscribeConfigDialog(QDialog):
 
 
     def _on_backend_changed(self, index: int) -> None:
+        if not hasattr(self, "_mode_combo"):
+            return
         is_crisper = self._backend_combo.currentData() == "crisperwhisper"
         self._mode_combo.setVisible(is_crisper)
         self._mode_label.setVisible(is_crisper)
@@ -264,9 +271,14 @@ class TranscribeConfigDialog(QDialog):
         if is_crisper:
             if self._model_edit.text() in ("medium.en", "medium"):
                 self._model_edit.setText("turbo")
+            ## END if model is openai default....
+
         else:
             if self._model_edit.text() in ("turbo", "medium"):
                 self._model_edit.setText("medium.en")
+            ## END if model is crisper default....
+
+        ## END if is_crisper....
 
 
     def _browse_dir(self) -> None:

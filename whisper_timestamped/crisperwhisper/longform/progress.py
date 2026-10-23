@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import sys
 import threading
 from contextlib import contextmanager
 from typing import Callable, Iterator, Optional
@@ -45,6 +47,63 @@ class _CallbackTqdm(tqdm):
         ## END if callback is not None and total....
 
         return result
+
+
+def _install_openai_whisper_tqdm_hook() -> Callable[[], None]:
+    """Point openai-whisper's ``tqdm.tqdm`` at ``_CallbackTqdm``.
+
+    openai-whisper does ``import tqdm`` then ``tqdm.tqdm(...)`` in
+    ``whisper/transcribe.py``.  CrisperWhisper already constructs
+    ``_CallbackTqdm`` directly; this patch is what makes OpenAI Whisper
+    frame bars report to ``set_audio_progress_callback``.
+    """
+    transcribe_mod = sys.modules.get("whisper.transcribe")
+    if transcribe_mod is None:
+        try:
+            transcribe_mod = importlib.import_module("whisper.transcribe")
+        except ImportError:
+            return lambda: None
+        ## END try import whisper.transcribe....
+
+    ## END if whisper.transcribe not loaded....
+
+    tqdm_ns = getattr(transcribe_mod, "tqdm", None)
+    if tqdm_ns is None or not hasattr(tqdm_ns, "tqdm"):
+        return lambda: None
+    previous = tqdm_ns.tqdm
+    if previous is _CallbackTqdm:
+        return lambda: None
+    tqdm_ns.tqdm = _CallbackTqdm
+
+    def restore() -> None:
+        if getattr(tqdm_ns, "tqdm", None) is _CallbackTqdm:
+            tqdm_ns.tqdm = previous
+        ## END if still patched....
+
+    return restore
+
+
+@contextmanager
+def audio_progress_hook(
+    callback: Optional[Callable[[float], None]],
+) -> Iterator[None]:
+    """Install the progress callback for CrisperWhisper and OpenAI Whisper.
+
+    CrisperWhisper reports through ``_CallbackTqdm`` in longform loops.
+    OpenAI Whisper reports through the same class after its tqdm is patched.
+    """
+    set_audio_progress_callback(callback)
+    restore = (
+        _install_openai_whisper_tqdm_hook()
+        if callback is not None
+        else (lambda: None)
+    )
+    try:
+        yield
+    finally:
+        restore()
+        set_audio_progress_callback(None)
+    ## END try audio_progress_hook....
 
 
 def frame_pos(sample_index: int) -> int:

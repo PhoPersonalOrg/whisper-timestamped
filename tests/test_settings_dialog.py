@@ -13,6 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from scripts.gui.dialogs import TranscribeConfigDialog
 from scripts.gui.settings_dialog import SettingsDialog, alt_held
 from whisper_timestamped.recording_formats import list_format_ids
 
@@ -84,4 +85,21 @@ class TestSettingsDialogAccessors(unittest.TestCase):
         self.assertEqual(dlg.idle_seconds(), 120)
         self.assertFalse(dlg.low_priority())
         self.assertEqual(dlg.folders(), folders)
+        dlg.close()
+
+
+class TestTranscribeConfigDialog(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = _app()
+
+    def test_openai_backend_initializes_without_mode_combo_error(self):
+        dlg = TranscribeConfigDialog(
+            default_output_dir="D:/out",
+            initial_backend="openai-whisper",
+            initial_model="large-v3",
+        )
+        self.assertEqual(dlg.backend(), "openai-whisper")
+        self.assertEqual(dlg.model_name(), "large-v3")
+        self.assertTrue(hasattr(dlg, "_mode_combo"))
         dlg.close()
