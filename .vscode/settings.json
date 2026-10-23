@@ -1,3 +1,8 @@
 {
-	"kiroAgent.configureMCP": "Disabled"
+  "kiroAgent.configureMCP": "Disabled",
+  "files.exclude": {
+    "**/.pytest_cache": true,
+    "**/.cursor/.ts": true,
+    "**/.ts": true
+  }
 }
