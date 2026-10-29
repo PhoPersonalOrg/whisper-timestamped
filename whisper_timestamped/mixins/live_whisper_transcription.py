@@ -164,10 +164,10 @@ class LiveWhisperTranscriptionAppMixin:
         """
         _, LiveConfig = _import_live_transcription()
         self.transcription_config = LiveConfig(
-            model="medium",  # Good balance of speed and accuracy
-            device=None,  # Auto-detect: LiveTranscriber prefers CUDA when available, falls back to CPU
+            model="large-v3",
+            device="cuda",
             compute_type=None,  # Auto-detect: float16 on CUDA, int8 on CPU
-            language='en',  # Auto-detect
+            language='en',
             beam_size=1,
             vad_filter=True,
             chunk_length_s=15.0,

@@ -41,10 +41,10 @@ def _startup_mark(label: str, since: float) -> None:
 
 @dataclass
 class LiveConfig:
-    model: str = "small"
-    device: Optional[str] = None  # "cuda"|"cpu"|None(auto)
+    model: str = "large-v3"
+    device: Optional[str] = "cuda"  # "cuda"|"cpu"|None(auto)
     compute_type: Optional[str] = None  # "float16"|"int8"|None(auto)
-    language: Optional[str] = None
+    language: Optional[str] = "en"
     beam_size: int = 1
     vad_filter: bool = True
     chunk_length_s: float = 15.0
@@ -339,10 +339,10 @@ class LiveTranscriber:
 
 def cli(argv: Optional[List[str]] = None):
     p = argparse.ArgumentParser(description="Near real-time microphone transcription with faster-whisper")
-    p.add_argument("--model", default="small", help="Model size or path (e.g., tiny, base, small, medium, large-v3)")
-    p.add_argument("--device", default=None, help="cuda or cpu (auto if omitted)")
+    p.add_argument("--model", default="large-v3", help="Model size or path (e.g., tiny, base, small, medium, large-v3)")
+    p.add_argument("--device", default="cuda", help="cuda or cpu (auto if omitted)")
     p.add_argument("--compute-type", dest="compute_type", default=None, help="float16, int8, int8_float16, etc. (auto if omitted)")
-    p.add_argument("--language", default=None, help="Hint language code (auto-detect if omitted)")
+    p.add_argument("--language", default="en", help="Hint language code (auto-detect if omitted)")
     p.add_argument("--beam-size", dest="beam_size", type=int, default=1)
     p.add_argument("--no-vad", dest="no_vad", action="store_true", help="Disable internal VAD filter")
     p.add_argument("--chunk-length", dest="chunk_length_s", type=float, default=15.0, help="Inference window seconds")
