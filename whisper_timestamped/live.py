@@ -151,13 +151,9 @@ class LiveTranscriber:
         self.jsonl_path = self.basepath.with_suffix(".jsonl")
         self.wav_path = self.basepath.with_suffix(".wav")
 
-    def _audio_callback(self, indata, frames, time_info, status):  # called by sounddevice thread
-        if status:
-            # Drop if queue full to avoid backpressure
-            pass
-        mono = indata[:, 0] if indata.ndim == 2 else indata
+    def _on_hub_audio(self, data):  # called by MicCaptureHub (PortAudio thread)
         try:
-            self._audio_q.put_nowait(mono.copy())
+            self._audio_q.put_nowait(data)
         except queue.Full:
             # Drop the block; ring buffer continues via writer thread
             pass
@@ -300,24 +296,22 @@ class LiveTranscriber:
             if new_emissions:
                 self._emit(new_emissions)
 
-    def start(self):
-        if sd is None:
-            raise RuntimeError("sounddevice/soundfile not available. Please install extras.")
+    def start(self, hub=None):
+        from whisper_timestamped.audio_capture import get_shared_mic_hub
 
         # Start audio capture
         self._stop_event.clear()
         self._writer_thread = threading.Thread(target=self._audio_writer, daemon=True)
         self._writer_thread.start()
 
-        self._stream = sd.InputStream(
-            samplerate=self.cfg.sample_rate,
+        self._hub = hub if hub is not None else get_shared_mic_hub()
+        self._hub.subscribe(
+            self._on_hub_audio,
+            sample_rate=self.cfg.sample_rate,
             channels=self.cfg.channels,
             dtype=self.cfg.dtype,
             device=self.cfg.mic_device,
-            blocksize=int(self.cfg.sample_rate * 0.05),  # ~50ms blocks
-            callback=self._audio_callback,
         )
-        self._stream.start()
 
         # Start inference loop
         self._transcribe_thread = threading.Thread(target=self._transcriber_loop, daemon=True)
@@ -325,12 +319,13 @@ class LiveTranscriber:
 
     def stop(self):
         self._stop_event.set()
-        try:
-            if hasattr(self, "_stream"):
-                self._stream.stop()
-                self._stream.close()
-        except Exception:
-            pass
+        hub = getattr(self, "_hub", None)
+        if hub is not None:
+            try:
+                hub.unsubscribe(self._on_hub_audio)
+            except Exception:
+                pass
+            self._hub = None
         if hasattr(self, "_transcribe_thread"):
             self._transcribe_thread.join(timeout=2.0)
         if hasattr(self, "_writer_thread"):
